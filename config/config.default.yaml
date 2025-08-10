@@ -1,0 +1,33 @@
+project:
+  # Coordinate reference system for spatial operations
+  crs: "EPSG:4326"
+  # H3 resolution used to aggregate clusters
+  h3_res: 8
+data:
+  # Location of raw SGCharts archive CSVs
+  sgcharts_csv_dir: "data/raw/sgcharts_csv"
+  # Directory for live NEA cluster pulls (has not been populated yet)
+  nea_geojson_dir: "data/raw/nea_live"
+  # CSV file for weekly MOH infectious disease counts
+  moh_weekly_csv: "data/raw/moh_weekly_cases.csv"
+  # Directory containing MSS weather data downloads
+  mss_weather_dir: "data/raw/mss_weather"
+  # GeoJSON file for URA subzones
+  ura_subzones_path: "data/external/ura_subzones.geojson"
+  # Root output directory for processed datasets
+  processed_dir: "data/processed"
+features:
+  # List of weekly lags to compute for weather variables
+  lags_weeks: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+  # Whether to derive absolute humidity and include it in features
+  use_absolute_humidity: true
+model:
+  cv:
+    # Type of cross‐validation split (e.g. year_block for out-of-time)
+    split: "year_block"
+    n_splits: 3
+  interaction: true
+viz:
+  maps:
+    # Aggregate H3 predictions back to URA subzones for maps
+    aggregate_to_ura: true
