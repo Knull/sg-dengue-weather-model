@@ -1,0 +1,16 @@
+# Citation file for the Dengue–Weather Singapore project
+#
+# This file describes how to cite this repository.  If you use or extend
+# this code in your own work, please include the following citation in your
+# acknowledgement section or bibliography.
+
+cff-version: 1.2.0
+message: "If you use this project in your research, please cite it as below."
+authors:
+  - given-names: "Student"
+    family-names: "Researcher"
+    orcid: "https://orcid.org/0000-0000-0000-0000"
+title: "Weather–Dengue Spatiotemporal Analysis for Singapore"
+version: "0.1.0"
+date-released: "2025-08-10"
+repository-code: "https://example.com/dengue-weather-singapore"

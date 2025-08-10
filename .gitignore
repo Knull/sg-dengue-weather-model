@@ -1,0 +1,27 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environments and dependency caches
+.venv/
+.uv/
+.ruff_cache/
+.pytest_cache/
+
+# Data directories 
+data/raw/
+data/interim/
+data/processed/
+data/external/*.zip
+
+# Checkpoints
+*.ipynb_checkpoints
+
+# Secrets & local overrides
+.env
+config/config.local.yaml
+
+# OS files
+.DS_Store
+Thumbs.db
