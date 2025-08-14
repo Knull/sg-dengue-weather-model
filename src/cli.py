@@ -332,7 +332,7 @@ def map_hindcast_cmd(
 ) -> None:
     """Generate a hindcast risk map for a given week aggregated to URA subzones."""
     cfg = load_config()
-    feat_path = features_path or str(Path(cfg.data.processed_dir) / "unit_week_features.parquet")
+    feat_path = features_path or str(Path(cfg.data["processed_dir"]) / "unit_week_features.parquet")
     map_hindcast(model_path, out_dir, features_path=feat_path, iso_year=iso_year, iso_week=iso_week)
 
 

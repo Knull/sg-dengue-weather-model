@@ -1,179 +1,139 @@
-"""
-Evaluation utilities for dengue-weather models.
+"""Evaluation utilities for dengue-weather models (panel logistic)."""
 
-This module contains helper functions to compute common classification
-metrics, perform year-block cross-validation and generate calibration
-curves.  You can import these helpers in notebooks or scripts to
-evaluate models beyond a simple train/test split.  The functions are
-written to be independent of the specific model implementation- as
-long as a model exposes a `predict_proba` method, it can be used
-with these evaluators.
-"""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import List, Optional, Union
 
 import json
-from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
-
 import numpy as np
 import pandas as pd
-from sklearn.base import BaseEstimator
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
-    brier_score_loss,
-    average_precision_score,
     roc_auc_score,
+    average_precision_score,
+    brier_score_loss,
 )
+from sklearn.preprocessing import StandardScaler
 
-from .panel_logit import fit_model  # reuse logistic trainer if needed
-from ..logging_setup import setup_logging
+LABEL_COL = "y_cluster_present"
+EXCLUDE_COLS = {
+    "h3",
+    "cluster_key",
+    LABEL_COL,
+    "peak_cases",
+    "left_censored",
+    "right_censored",
+}
 
+def compute_basic_metrics(y_true: np.ndarray, y_pred_proba: np.ndarray) -> dict:
+    """Compute common evaluation metrics"""
+    out: dict = {}
+    # Brier score is defined regardless of class distribution
+    out["brier_score"] = float(brier_score_loss(y_true, y_pred_proba))
+    # If only one class is present, ROC AUC and average precision are undefined.
+    # so, explicitly check for this condition and assign NaN to the metrics.
+    unique_classes = set(int(v) for v in np.unique(y_true))
+    if len(unique_classes) < 2:
+        out["roc_auc"] = float("nan")
+        out["average_precision"] = float("nan")
+        return out
+    # Compute AUC; fallback to NaN on error
+    try:
+        out["roc_auc"] = float(roc_auc_score(y_true, y_pred_proba))
+    except Exception:
+        out["roc_auc"] = float("nan")
+    # Compute average precision; fallback to NaN on error
+    try:
+        out["average_precision"] = float(average_precision_score(y_true, y_pred_proba))
+    except Exception:
+        out["average_precision"] = float("nan")
+    return out
 
-def compute_basic_metrics(
-    y_true: Sequence[int], y_pred_proba: Sequence[float]
-) -> Dict[str, float]:
-    """Compute fundamental classification metrics.
+def _select_numeric_features(df: pd.DataFrame) -> List[str]:
+    numeric = df.select_dtypes(include=["number"]).columns
+    cols = [c for c in numeric if c not in EXCLUDE_COLS]
+    cols = [c for c in cols if df[c].nunique(dropna=True) > 1]
+    return cols
 
-    Parameters
-    ----------
-    y_true : sequence of int
-        Ground truth binary labels (0/1).
-    y_pred_proba : sequence of float
-        Model-predicted probabilities of the positive class.
+def _load_df(df_or_path: Union[str, Path, pd.DataFrame]) -> pd.DataFrame:
+    if isinstance(df_or_path, (str, Path)):
+        return pd.read_parquet(df_or_path)
+    return df_or_path
 
-    Returns
-    -------
-    dict
-        A dictionary containing ROC AUC, average precision and Brier score.
-    """
-    y_true_arr = np.asarray(y_true)
-    y_pred_arr = np.asarray(y_pred_proba)
-    return {
-        "roc_auc": float(roc_auc_score(y_true_arr, y_pred_arr)),
-        "average_precision": float(average_precision_score(y_true_arr, y_pred_arr)),
-        "brier_score": float(brier_score_loss(y_true_arr, y_pred_arr)),
-    }
-
-
-def calibration_curve(
-    y_true: Sequence[int],
-    y_pred_proba: Sequence[float],
-    n_bins: int = 10,
-    strategy: str = "quantile",
-) -> pd.DataFrame:
-    """Compute calibration (reliability) curve data.
-
-    Parameters
-    ----------
-    y_true : sequence of int
-        True binary outcomes.
-    y_pred_proba : sequence of float
-        Predicted probabilities.
-    n_bins : int, optional
-        Number of bins to compute.  Defaults to 10.
-    strategy : {"uniform", "quantile"}, optional
-        Binning strategy.  ``"quantile"`` bins contain equal
-        numbers of samples; ``"uniform"`` bins span equal
-        probability ranges.
-
-    Returns
-    -------
-    DataFrame
-        Columns ``bin_center``, ``mean_predicted``, ``fraction_positive``, ``count``.
-    """
-    # Sort by predicted probabilities
-    data = pd.DataFrame({"y_true": y_true, "y_pred": y_pred_proba})
-    if strategy == "quantile":
-        data["bin"] = pd.qcut(data["y_pred"], q=n_bins, duplicates="drop")
-    else:
-        data["bin"] = pd.cut(data["y_pred"], bins=n_bins, include_lowest=True)
-    grouped = data.groupby("bin")
-    summary = grouped.agg(
-        count=("y_true", "count"),
-        mean_predicted=("y_pred", "mean"),
-        fraction_positive=("y_true", "mean"),
-    ).reset_index(drop=True)
-    summary["bin_center"] = summary["mean_predicted"]
-    return summary
-
+def _contiguous_year_blocks(years: List[int], n_splits: int) -> List[List[int]]:
+    years = sorted(years)
+    k, n = n_splits, len(years)
+    sizes = [n // k + (1 if i < n % k else 0) for i in range(k)]
+    blocks, idx = [], 0
+    for s in sizes:
+        blocks.append(years[idx: idx + s])
+        idx += s
+    return blocks
 
 def year_block_cv(
-    df: pd.DataFrame,
-    model_params: Optional[Dict[str, Any]] = None,
+    df_or_path: Union[str, Path, pd.DataFrame],
     n_splits: int = 3,
-    target_col: str = "y_cluster_present",
-    random_state: int = 42,
+    *,
+    model_params: Optional[dict] = None,
+    random_state: int = 42,  # kept for API compatibility
 ) -> pd.DataFrame:
-    """Perform block cross-validation by ISO year.
-
-    The dataset is partitioned by unique ISO years into ``n_splits` nearly
-    equal folds.  Each fold acts as the test set exactly once.  A
-    :class:`~sklearn.linear_model.LogisticRegression` is trained on the
-    remaining folds and evaluated on the holdout. The resulting metrics
-    for each fold are returned as a DataFrame.
-
-    Parameters
-    ----------
-    df : DataFrame
-        DataFrame containing features, labels and an `iso_year` column.
-    model_params : dict, optional
-        Parameters passed to the logistic regression constructor.  If
-        `None`, sensible defaults are used (`max_iter=1000`,
-        `class_weight='balanced'`).
-    n_splits : int, optional
-        Number of folds (must be >= 2).  Defaults to 3.
-    target_col : str, optional
-        Name of the target column.  Defaults to ``"y_cluster_present"``.
-    random_state : int, optional
-        Random seed used only for reproducibility when splitting years
-        into folds.
-
-    Returns
-    -------
-    DataFrame
-        One row per fold with columns ``fold``, ``years`` (list of
-        holdout years) and metric columns from :func:`compute_basic_metrics`.
-    """
-    setup_logging()
+    df = _load_df(df_or_path)
     if "iso_year" not in df.columns:
         raise ValueError("DataFrame must contain 'iso_year' for year-block CV.")
     if n_splits < 2:
         raise ValueError("n_splits must be at least 2.")
-    model_params = model_params or {}
-    # Determine feature columns (exclude identifiers and target)
-    exclude = {target_col, "h3", "cluster_key"}
-    feature_cols = [
-        c
-        for c in df.columns
-        if c not in exclude and not pd.api.types.is_object_dtype(df[c])
-    ]
+
+    feature_cols = _select_numeric_features(df)
     if not feature_cols:
-        raise ValueError("No numeric features found for cross-validation.")
-    # Unique ISO years sorted for reproducibility
-    years = sorted(df["iso_year"].dropna().astype(int).unique())
-    if len(years) < n_splits:
-        raise ValueError(
-            f"Not enough unique iso_year values ({len(years)}) for {n_splits} splits."
+        raise ValueError("No numeric feature columns available for CV after exclusions.")
+
+    uniq_years = sorted(df["iso_year"].dropna().astype(int).unique().tolist())
+    if len(uniq_years) < n_splits:
+        n_splits = len(uniq_years)
+    blocks = _contiguous_year_blocks(uniq_years, n_splits)
+
+    rows = []
+    for i, test_years in enumerate(blocks, start=1):
+        train_years = [y for y in uniq_years if y not in test_years]
+        train_df = df[df["iso_year"].isin(train_years)].copy()
+        test_df = df[df["iso_year"].isin(test_years)].copy()
+
+        X_tr = train_df[feature_cols].fillna(0.0).astype("float64").values
+        y_tr = train_df[LABEL_COL].astype(int).values
+        X_te = test_df[feature_cols].fillna(0.0).astype("float64").values
+        y_te = test_df[LABEL_COL].astype(int).values
+
+        scaler = StandardScaler(with_mean=True, with_std=True)
+        X_tr = scaler.fit_transform(X_tr)
+        X_te = scaler.transform(X_te)
+
+        params = {"max_iter": 2000, "class_weight": "balanced"}
+        if model_params:
+            params.update({k: v for k, v in model_params.items() if v is not None})
+
+        # If the training set contains only a single class, a logistic regression model cannot be fitted. Instead, fall back to a constant predictor equal to the sole class value (0 or 1) and compute metrics directly. This avoids raising an exception from scikit-learn.
+        uniq_train = np.unique(y_tr)
+        if len(uniq_train) < 2:
+            # constant predicted probability: 0.0 if all labels are 0, 1.0 if all are 1
+            const_pred = float(uniq_train[0]) if len(uniq_train) == 1 else 0.0
+            p_te = np.full(len(y_te), const_pred, dtype=float)
+            metrics = compute_basic_metrics(y_te, p_te)
+        else:
+            clf = LogisticRegression(**params)
+            clf.fit(X_tr, y_tr)
+            p_te = clf.predict_proba(X_te)[:, 1]
+            metrics = compute_basic_metrics(y_te, p_te)
+
+        rows.append(
+            {
+                "fold": i,
+                "train_years": ",".join(map(str, train_years)),
+                "test_years": ",".join(map(str, test_years)),
+                "n_train": int(len(y_tr)),
+                "n_test": int(len(y_te)),
+                **metrics,
+            }
         )
-    # Partition years into n_splits contiguous groups
-    # Use numpy array_split to balance sizes
-    year_folds = np.array_split(years, n_splits)
-    results = []
-    for fold_idx, hold_years in enumerate(year_folds):
-        hold_years = list(hold_years)
-        train_df = df[~df["iso_year"].isin(hold_years)]
-        test_df = df[df["iso_year"].isin(hold_years)]
-        X_train = train_df[feature_cols].fillna(0.0)
-        y_train = train_df[target_col]
-        X_test = test_df[feature_cols].fillna(0.0)
-        y_test = test_df[target_col]
-        # Fit logistic regression on training years
-        # Use balanced class weights by default unless specified
-        default_params = {"max_iter": 1000, "class_weight": "balanced"}
-        params = {**default_params, **model_params}
-        model = LogisticRegression(**params)
-        model.fit(X_train, y_train)
-        y_pred_prob = model.predict_proba(X_test)[:, 1]
-        metrics = compute_basic_metrics(y_test, y_pred_prob)
-        metrics.update({"fold": fold_idx, "years": hold_years})
-        results.append(metrics)
-    return pd.DataFrame(results)
+
+    return pd.DataFrame(rows)

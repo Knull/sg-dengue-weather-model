@@ -25,3 +25,4 @@ config/config.local.yaml
 # OS files
 .DS_Store
 Thumbs.db
+/src/dengueweather.egg-info

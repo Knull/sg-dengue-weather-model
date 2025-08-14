@@ -1,27 +1,15 @@
 # src/dengueweather/ingest/mss_weather.py
-"""
-Build weekly weather features from MSS monthly daily CSVs (e.g., Changi).
-
-Input directory layout (for MVP):
-  data/raw/mss_weather/CHANGI/daily/*.csv
-Each CSV has columns like:
-  Station, Year, Month, Day, Daily Rainfall Total (mm), Mean Temperature (°C),
-  Mean Relative Humidity (%), Mean Wind Speed (km/h), ...
-
-Outputs:
-  data/interim/weather_daily.parquet
-  data/interim/weather_weekly.parquet
-with canonical columns:
-  rain_mm, temp_c, rh_pct, wind_kmh, abs_humidity_gm3 (optional),
-  iso_year, iso_week
-"""
+"""Build weekly weather features from MSS monthly daily CSVs (e.g., Changi)."""
 
 from __future__ import annotations
+
 import re
 from pathlib import Path
 from typing import Optional, List
+
 import numpy as np
 import pandas as pd
+
 from dengueweather.config import load_config
 from ..logging_setup import setup_logging
 
@@ -29,7 +17,7 @@ from ..logging_setup import setup_logging
 def _normalize_cols(cols: List[str]) -> List[str]:
     out = []
     for c in cols:
-        c0 = str(c).strip().replace("—", "-")
+        c0 = str(c).strip().replace("—", "-") # non-standard characters, just inc ase. 
         c0 = re.sub(r"\(.*?\)", "", c0)  # drop "(mm)" etc.
         c0 = c0.replace("°", "")
         c0 = c0.lower()
@@ -51,16 +39,23 @@ def _absolute_humidity(temp_c: pd.Series, rh_pct: pd.Series) -> pd.Series:
     return 2.1674 * e / (273.15 + T)
 
 
+def _read_csv_with_fallback(path: Path) -> pd.DataFrame:
+    encodings = ["utf-8-sig", "cp1252", "latin1"]
+    last_err: Optional[Exception] = None
+    for enc in encodings:
+        try:
+            return pd.read_csv(path, encoding=enc)
+        except Exception as e:
+            last_err = e
+    raise last_err if last_err else RuntimeError(f"Could not read {path} with fallback encodings")
+
+
 def _read_month_csv(path: Path) -> pd.DataFrame:
-    """Read one MSS monthly daily CSV and return normalized daily rows."""
-    df = pd.read_csv(path)
+    df = _read_csv_with_fallback(path)
     df.columns = _normalize_cols(list(df.columns))
 
-    # Prefer Year/Month/Day; fall back to any date column if present.
     if all(c in df.columns for c in ["year", "month", "day"]):
-        df["date"] = pd.to_datetime(
-            dict(year=df["year"], month=df["month"], day=df["day"]), errors="coerce"
-        )
+        df["date"] = pd.to_datetime(dict(year=df["year"], month=df["month"], day=df["day"]), errors="coerce")
     else:
         date_col = next((c for c in df.columns if "date" in c), None)
         if not date_col:
@@ -73,10 +68,11 @@ def _read_month_csv(path: Path) -> pd.DataFrame:
                 return c
         return None
 
-    c_rain = pick("daily_rainfall_total")
-    c_temp = pick("mean_temperature")
-    c_rh   = pick("mean_relative_humidity")
-    c_wind = pick("mean_wind_speed")
+    # incrase no. of synonyms
+    c_rain = pick("daily_rainfall_total", "rainfall_total", "rain_mm", "rainfall")
+    c_temp = pick("mean_temperature", "avg_temperature", "temperature")
+    c_rh   = pick("mean_relative_humidity", "relative_humidity", "mean_rh", "rh")
+    c_wind = pick("mean_wind_speed", "wind_speed", "avg_wind_speed")
 
     keep = ["date"]
     ren = {}
@@ -86,19 +82,15 @@ def _read_month_csv(path: Path) -> pd.DataFrame:
     if c_wind: keep.append(c_wind); ren[c_wind] = "wind_kmh"
 
     out = df[keep].rename(columns=ren)
-
-    # Clean numeric columns (convert dashes / blanks to NaN)
     for c in ["rain_mm", "temp_c", "rh_pct", "wind_kmh"]:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce")
-
     return out
 
 
 def weekly_from_dir(raw_dir: str, out_daily: str, out_weekly: str, compute_ah: bool = True) -> None:
-    """
-    Read all monthly daily CSVs under raw_dir and produce daily/weekly parquet files.
-    """
+    """ Read all monthly daily CSVs under raw_dir and produce daily/weekly parquet files."""
+    setup_logging()
     raw = Path(raw_dir)
     files = sorted(raw.rglob("*.csv"))
     if not files:
@@ -110,7 +102,16 @@ def weekly_from_dir(raw_dir: str, out_daily: str, out_weekly: str, compute_ah: b
             frames.append(_read_month_csv(f))
         except Exception as e:
             print(f"[WARN] Skipping {f.name}: {e}")
-    daily = pd.concat(frames, ignore_index=True).dropna(subset=["date"]).sort_values("date")
+
+    if not frames:
+        raise SystemExit(f"Failed to read any CSVs under {raw}. Check encoding or file format.")
+
+    daily = (
+        pd.concat(frames, ignore_index=True)
+          .dropna(subset=["date"])
+          .sort_values("date")
+          .reset_index(drop=True)
+    )
 
     if compute_ah and {"temp_c", "rh_pct"}.issubset(daily.columns):
         daily["abs_humidity_gm3"] = _absolute_humidity(daily["temp_c"], daily["rh_pct"])
@@ -144,10 +145,6 @@ def weekly_from_dir(raw_dir: str, out_daily: str, out_weekly: str, compute_ah: b
 
 
 def main_cli():
-    """
-    CLI entry point used by `make ingest-weather`.
-    Reads config.data.mss_weather_dir and processes CHANGI/daily/*.csv.
-    """
     setup_logging()
     cfg = load_config()
     root = Path(cfg.data.mss_weather_dir) / "CHANGI" / "daily"
