@@ -2,7 +2,7 @@
 Gradient Boosting Model (LightGBM) for high-precision dengue forecasting.
 Includes isotonic calibration to ensure probabilities are realistic.
 """
-
+import sys
 from pathlib import Path
 from typing import Dict, Optional, List
 import json
@@ -136,3 +136,124 @@ def eval_gbm(model_path: str, features_path: str, out: str) -> None:
     with open(out, "w") as fh:
         json.dump(metrics, fh, indent=2)
     print(f"GBM Evaluation: {metrics} -> {out}")
+
+# In src/dengueweather/model/panel_gbm.py (or wherever you put run_cv)
+
+def run_cv(
+    features_path: str,
+    out: str,
+    n_splits: int = 3
+) -> None:
+    """Run temporal cross-validation, strictly ignoring years with no data."""
+    setup_logging()
+    print(f"Loading features from {features_path}...")
+    df = pd.read_parquet(features_path).fillna(0)
+
+    # 1. Filter for years that actually have clusters (targets)
+    # If a year has 0 positive labels, it's likely missing data, not a 'miracle year'.
+    valid_years = []
+    all_years = sorted(df["iso_year"].unique())
+    
+    for year in all_years:
+        n_pos = df[df["iso_year"] == year][LABEL_COL].sum()
+        if n_pos > 0:
+            valid_years.append(year)
+        else:
+            print(f"[Warn] Excluding year {year} from CV (0 positive labels found).")
+
+    if len(valid_years) < n_splits:
+        print(f"Error: Not enough valid labeled years ({len(valid_years)}) for {n_splits} splits.")
+        return
+
+    # Filter dataframe to only valid years
+    df = df[df["iso_year"].isin(valid_years)].copy()
+    print(f"Running CV on valid years: {valid_years}")
+
+    # 2. Create contiguous blocks
+    block_size = len(valid_years) // n_splits
+    test_blocks = []
+    for i in range(n_splits):
+        start = i * block_size
+        # Last block takes the remainder
+        end = (i + 1) * block_size if i < n_splits - 1 else len(valid_years)
+        test_blocks.append(valid_years[start:end])
+
+    feature_cols = _select_feature_cols(df)
+    results = []
+
+    print(f"\nStarting {n_splits}-fold Time-Series CV...")
+
+    for i, test_years in enumerate(test_blocks):
+        print(f"Fold {i+1}/{n_splits}: Testing on years {test_years}")
+        
+        # Split Data
+        train_mask = ~df["iso_year"].isin(test_years)
+        test_mask = df["iso_year"].isin(test_years)
+        
+        X_tr = df.loc[train_mask, feature_cols].values
+        y_tr = df.loc[train_mask, LABEL_COL].astype(int).values
+        X_te = df.loc[test_mask, feature_cols].values
+        y_te = df.loc[test_mask, LABEL_COL].astype(int).values
+
+        if len(np.unique(y_tr)) < 2:
+            print("  Skipping fold (only 1 class in training).")
+            continue
+        if len(np.unique(y_te)) < 2:
+            print(f"  Skipping fold (only 1 class in test set for years {test_years}).")
+            continue
+
+        # Train Base Model
+        base = lgb.LGBMClassifier(
+            n_estimators=500,
+            learning_rate=0.05,
+            num_leaves=31,
+            class_weight="balanced",
+            random_state=42,
+            n_jobs=-1,
+            verbose=-1
+        )
+        
+        # Calibrate
+        calibrated = CalibratedClassifierCV(base, method="isotonic", cv=3)
+        calibrated.fit(X_tr, y_tr)
+        
+        # Predict
+        probs = calibrated.predict_proba(X_te)[:, 1]
+        
+        # Metrics
+        auc = roc_auc_score(y_te, probs)
+        ap = average_precision_score(y_te, probs)
+        
+        # Calculate Top-20 Precision for this fold
+        fold_df = df.loc[test_mask, ["iso_year", "iso_week", LABEL_COL]].copy()
+        fold_df["pred"] = probs
+        
+        precisions = []
+        for _, wk_df in fold_df.groupby(["iso_year", "iso_week"]):
+            if wk_df[LABEL_COL].sum() > 0:
+                top_20 = wk_df.sort_values("pred", ascending=False).head(20)
+                precisions.append(top_20[LABEL_COL].mean())
+        
+        mean_p20 = np.mean(precisions) if precisions else 0.0
+        
+        print(f"  --> AUC: {auc:.4f}, AP: {ap:.4f}, Precision@20: {mean_p20:.4f}")
+        
+        results.append({
+            "fold": i + 1,
+            "test_years": str(test_years),
+            "roc_auc": auc,
+            "average_precision": ap,
+            "precision_at_20": mean_p20
+        })
+
+    # Save summary
+    res_df = pd.DataFrame(results)
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
+    res_df.to_csv(out, index=False)
+    
+    if "tabulate" in sys.modules:
+        print("\nCV Results Summary:")
+        print(res_df.to_markdown(index=False))
+    else:
+        print("\nCV Results Summary:")
+        print(res_df)

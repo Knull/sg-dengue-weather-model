@@ -23,7 +23,7 @@ from dengueweather.model.eval import year_block_cv, spatial_block_cv # Added spa
 from dengueweather.viz.lag_curves import plot_lag_curves
 from dengueweather.viz.interaction_surfaces import plot_interaction
 from dengueweather.viz.maps import map_hindcast
-from dengueweather.model.panel_gbm import fit_gbm, eval_gbm
+from dengueweather.model.panel_gbm import fit_gbm, eval_gbm, run_cv  
 
 app = typer.Typer(add_completion=False, help="Dengue-weather command-line interface")
 
@@ -237,7 +237,15 @@ def build_features_cmd(
 
 
 # MODELLING COMMANDS
-
+@app.command("cv-gbm")
+def cv_gbm_cmd(
+    features_path: str = typer.Option("data/processed/unit_week_features.parquet"),
+    out: str = typer.Option("data/processed/cv_results_gbm.csv"),
+    n_splits: int = typer.Option(3, help="Number of time blocks to split")
+) -> None:
+    """Run a realistic Time-Block Cross-Validation on the GBM model."""
+    run_cv(features_path, out, n_splits=n_splits)
+    
 @app.command("fit-panel-logit")
 def fit_panel_logit_cmd(
     features_path: str = typer.Option(
@@ -476,6 +484,152 @@ def eval_gbm_cmd(
 ) -> None:
     """Evaluate the GBM model."""
     eval_gbm(model_path, features_path, out)
+
+
+@app.command("patch-live-week")
+def patch_live_week(
+    live_geojson: str = typer.Option(..., help="Path to the live NEA GeoJSON file"),
+    features_path: str = typer.Option("data/processed/unit_week_features.parquet"),
+    out: str = typer.Option("data/processed/unit_week_features.parquet"),
+) -> None:
+    """
+    Tactical Command: Merges Live NEA Clusters + Latest Weather into the feature set.
+    Includes robust coordinate handling and centroid fallback for small polygons.
+    """
+    import json
+    import pandas as pd
+    import h3
+    import datetime
+    from shapely.geometry import shape, mapping
+    from shapely.ops import transform
+    
+    # 1. Load Live Clusters
+    typer.echo(f"Loading live clusters from {live_geojson}...")
+    with open(live_geojson, "r") as f:
+        data = json.load(f)
+    
+    df_feat = pd.read_parquet(features_path)
+    if df_feat.empty:
+        raise typer.Exit(1)
+        
+    sample_h3 = df_feat["h3"].iloc[0]
+    res = h3.h3_get_resolution(sample_h3)
+    typer.echo(f"Using H3 resolution: {res}")
+    
+    live_h3s = set()
+    features_list = data.get("features", [])
+    if not features_list:
+        if data.get("type") in ["Polygon", "MultiPolygon", "GeometryCollection"]:
+            features_list = [{"geometry": data}]
+
+    typer.echo(f"Processing {len(features_list)} features...")
+
+    for i, feature in enumerate(features_list):
+        geom = feature.get("geometry", feature)
+        if not geom or "coordinates" not in geom:
+            continue
+            
+        try:
+            shp = shape(geom)
+            
+            # Normalize to list of Polygons
+            polys = []
+            if shp.geom_type == 'Polygon':
+                polys.append(shp)
+            elif shp.geom_type == 'MultiPolygon':
+                polys.extend(shp.geoms)
+            
+            for poly in polys:
+                # STRATEGY 1: Standard Polyfill (Lon, Lat)
+                added = False
+                try:
+                    hexes = h3.polyfill(mapping(poly), res, geo_json_conformant=True)
+                    if hexes:
+                        live_h3s.update(hexes)
+                        added = True
+                except: pass
+                
+                # STRATEGY 2: Coordinate Swap (Lat, Lon)
+                if not added:
+                    try:
+                        # Swap x,y coordinates
+                        swapped_poly = transform(lambda x, y, z=None: (y, x), poly)
+                        hexes = h3.polyfill(mapping(swapped_poly), res, geo_json_conformant=True)
+                        if hexes:
+                            live_h3s.update(hexes)
+                            added = True
+                            typer.echo(f"  Feature {i}: Fixed via coordinate swap.")
+                    except: pass
+
+                # STRATEGY 3: Centroid Fallback (Tiny polygons)
+                # If a polygon is smaller than a hex, polyfill returns empty. 
+                # We simply take the center point.
+                if not added:
+                    centroid = poly.centroid
+                    # Try Lon, Lat
+                    h = h3.geo_to_h3(centroid.y, centroid.x, res)
+                    if h:
+                        live_h3s.add(h)
+                        # typer.echo(f"  Feature {i}: Used centroid fallback.")
+                        added = True
+                    else:
+                        # Try Lat, Lon
+                        h = h3.geo_to_h3(centroid.x, centroid.y, res)
+                        if h: 
+                            live_h3s.add(h)
+                            added = True
+
+        except Exception as e:
+            typer.echo(f"Warning: Failed to process feature {i}: {e}")
+
+    typer.echo(f"Found {len(live_h3s)} active H3 cells in live data.")
+    
+    if len(live_h3s) == 0:
+        typer.secho("CRITICAL: Still found 0 cells. Your GeoJSON might use a non-WGS84 projection (e.g. SVY21).", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+    # 2. Determine Forecast Week
+    target_date = datetime.date.today()
+    target_year, target_week, _ = target_date.isocalendar()
+    typer.echo(f"Targeting Forecast Week: {target_year}-W{target_week:02d}")
+
+    # 3. Get Latest Weather
+    df_sorted = df_feat.sort_values(["iso_year", "iso_week"])
+    last_week = df_sorted.iloc[-1]
+    last_year, last_iso = int(last_week["iso_year"]), int(last_week["iso_week"])
+    
+    # Filter grid
+    grid_df = df_feat[["h3"]].drop_duplicates().copy()
+    weather_source = df_sorted[(df_sorted["iso_year"] == last_year) & (df_sorted["iso_week"] == last_iso)].iloc[0]
+    
+    exclude_cols = {"h3", "iso_year", "iso_week", "y_cluster_present", "self_lag_1", "neighbor_pressure_lag_1"}
+    keep_cols = [c for c in df_feat.columns if c not in exclude_cols]
+    
+    new_week_df = grid_df.copy()
+    new_week_df["iso_year"] = target_year
+    new_week_df["iso_week"] = target_week
+    
+    for c in keep_cols:
+        if c in weather_source:
+            new_week_df[c] = weather_source[c]
+            
+    # 4. Fill Cluster Features
+    new_week_df["y_cluster_present"] = new_week_df["h3"].apply(lambda x: 1 if x in live_h3s else 0)
+    new_week_df["self_lag_1"] = new_week_df["y_cluster_present"]
+    
+    h3_set = set(live_h3s)
+    def get_pressure(h):
+        return sum(1 for k in h3.k_ring(h, 1) if k in h3_set)
+
+    new_week_df["neighbor_pressure_lag_1"] = new_week_df["h3"].apply(get_pressure)
+    
+    # 5. Save
+    df_clean = df_feat[~((df_feat["iso_year"] == target_year) & (df_feat["iso_week"] == target_week))]
+    final_df = pd.concat([df_clean, new_week_df], ignore_index=True)
+    final_df.to_parquet(out, index=False)
+    
+    typer.echo(f"Success. Wrote {len(new_week_df)} rows for {target_year}-W{target_week:02d} to {out}")
+
 def main() -> None:
     """Entry point for ``python -m src.cli``."""
     app()
