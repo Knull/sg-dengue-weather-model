@@ -326,6 +326,62 @@ def cv_panel_logit_cmd(
 
 # VISUALIZATION COMMANDS
 
+@app.command("rank-riskiest")
+def rank_riskiest(
+    model_path: str = typer.Option("data/processed/model.joblib", help="Trained model path"),
+    features_path: str = typer.Option("data/processed/unit_week_features.parquet", help="Features path"),
+    iso_year: int = typer.Option(..., help="Year to rank"),
+    iso_week: int = typer.Option(..., help="Week to rank"),
+    top_k: int = typer.Option(20, help="Number of top zones to display"),
+    out: Optional[str] = typer.Option(None, help="Optional path to save CSV results")
+) -> None:
+    """
+    Generate a ranked list of the 'Top-K' highest risk zones for a specific week.
+    
+    This command uses the calibrated probabilities to rank all Singapore subzones/hexagons.
+    """
+    import pandas as pd
+    import joblib
+    
+    # Load Model
+    payload = joblib.load(model_path)
+    model = payload["model"]
+    feature_cols = payload["feature_cols"]
+    scaler = payload["scaler"]
+    
+    # Load Data
+    df = pd.read_parquet(features_path)
+    subset = df[(df["iso_year"] == iso_year) & (df["iso_week"] == iso_week)].copy()
+    
+    if subset.empty:
+        typer.secho(f"No data found for {iso_year} week {iso_week}", fg=typer.colors.RED)
+        raise typer.Exit(1)
+        
+    # Predict
+    X = subset[feature_cols].fillna(0.0).astype("float64").values
+    Xs = scaler.transform(X)
+    probs = model.predict_proba(Xs)[:, 1]
+    
+    subset["risk_score"] = probs
+    
+    # Rank
+    ranked = subset.sort_values("risk_score", ascending=False).head(top_k)
+    
+    # Display
+    columns_to_show = ["h3", "risk_score", "y_cluster_present"]
+    # Add coordinates if possible
+    if "h3" in ranked.columns:
+        import h3
+        ranked["lat"] = ranked["h3"].apply(lambda x: h3.h3_to_geo(x)[0])
+        ranked["lon"] = ranked["h3"].apply(lambda x: h3.h3_to_geo(x)[1])
+        columns_to_show += ["lat", "lon"]
+        
+    typer.echo(f"\nTop {top_k} Riskiest Zones for {iso_year}-W{iso_week:02d}:")
+    typer.echo(ranked[columns_to_show].to_markdown(index=False))
+    
+    if out:
+        ranked.to_csv(out, index=False)
+        typer.echo(f"Saved to {out}")
 @app.command("plot-lag-curves")
 def plot_lag_curves_cmd(
     model_path: str = typer.Option(
