@@ -1,155 +1,124 @@
-# Singapore Dengue-Weather Model (`dengueweather`)
+# 🦟 Singapore Dengue Tactical Response Model
 
-**Weather–dengue spatiotemporal analysis for Singapore**
+A high-precision, spatiotemporal forecasting system designed to identify active dengue clusters in Singapore before they expand.
 
-This project provides a data pipeline and modelling framework to analyze the relationship between weather variables (temperature, rainfall, wind, humidity) and dengue cluster formation in Singapore. It includes tools for data ingestion, feature engineering, panel logistic regression modeling, and risk visualization.
+Unlike traditional weather-only models, this system calculates **Spatial Infection Pressure** (the "spark") alongside environmental suitability (the "fuel") to generate tactical intervention lists for NEA/Town Councils.
 
-## Features
+![Python](https://img.shields.io/badge/Python-3.11-blue)
+![Model](https://img.shields.io/badge/Model-LightGBM-green)
+![Spatial](https://img.shields.io/badge/Spatial-H3_Hexagons-orange)
+![Dashboard](https://img.shields.io/badge/Dashboard-Streamlit-red)
 
-* **Data Ingestion**: Automated tools to fetch and archive data from:
-    * **SGCharts**: Historical dengue cluster snapshots.
-    * **MSS**: Meteorological Service Singapore daily weather logs.
-    * **MOH**: Weekly infectious disease bulletins (PDF/CSV).
-    * **NEA**: Live dengue cluster data (GeoJSON).
-* **Spatio-temporal Analysis**:
-    * Builds stable cluster histories and "cluster-week" presence panels.
-    * Generates distributed lag models (DLMs) to capture delayed weather effects.
-    * Captures interactions (e.g., rainfall × temperature).
-* **Modelling**: Panel logistic regression to predict outbreak risk.
-* **Visualization**:
-    * Lag-response curves.
-    * Interaction surface plots.
-    * Hindcast risk maps.
-* **Dashboard**: A Streamlit app for interactive exploration.
+---
 
-## Installation
+## 🎯 The Goal: Save as many people.
+To prevent outbreaks, broad "risk maps" are insufficient. Resources are finite. This model answers one specific question:
+> **"Which 20 specific neighborhoods (H3 Hexagons) require boots-on-the-ground intervention *today*?"**
 
-**Prerequisites**: Python ≥ 3.11
+### Key Features
+* **Spatial Intelligence:** Uses H3 Hierarchical Geospatial Indexing to measure "Infection Pressure" from neighboring zones.
+* **Non-Linear Modeling:** Powered by a Calibrated **LightGBM** (Gradient Boosting Machine) to capture complex weather-lag interactions.
+* **Live "Patching" Engine:** Combines live NEA cluster data (via API) with persistence weather forecasts to predict risk for the *current* week.
+* **3D Command Dashboard:** Interactive Streamlit visualization for identifying risk towers on a street map.
 
-1.  **Clone the repository:**
-    ```bash
-    git clone https://github.com/your-username/sg-dengue-weather-model.git
-    cd sg-dengue-weather-model
-    ```
+---
 
-2.  **Install dependencies:**
-    This project uses `uv` for dependency management, but falls back to `pip` if unavailable.
-    ```bash
-    make init
-    ```
-    *Or manually:* `pip install -e .[dev]`
+## 🚀 Quick Start
 
-## Usage / Data Pipeline
-
-The project uses a `Makefile` to orchestrate the main stages of the pipeline.
-
-### 1. Data Ingestion
-Download and standardize raw data sources.
-```bash
-make ingest
-```
-
-* **Archives**: Merges SGCharts CSV snapshots into a single Parquet file.
-* **Weather**: Aggregates daily MSS station data into weekly summaries (including Absolute Humidity calculations).
-
-### 2. Panel Construction & Feature Engineering
-
-Build the spatiotemporal panel and generate features for modeling.
+### 1. Installation
+Clone the repo and install dependencies (including `lightgbm`, `h3`, `pydeck`).
 
 ```bash
-make features
+# Windows
+pip install -e .[dev]
+
 ```
 
-* **Panel**: Constructs a "cluster-week" table indicating where and when clusters existed.
-* **Features**: Merges weather data and computes distributed lags (e.g., weather conditions 1–12 weeks prior).
+### 2. The "Weekly Tactical" Workflow
 
-### 3. Modelling
-
-Train the panel logistic regression model.
+To generate the **Kill List** for the current week (e.g., Monday morning routine):
 
 ```bash
-make model
+# 1. Fetch the latest live cluster map from NEA
+python -m src.cli ingest-nea-live
+
+# 2. Patch the data (Merges Live Clusters + Latest Weather Forecast)
+# Replace the filename below with the one just downloaded in step 1
+python -m src.cli patch-live-week --live-geojson data/raw/nea_live/2026-01-03.geojson
+
+# 3. Generate the Priority List (Top 20 Riskiest Zones)
+# Use the Forecast Week printed by the patch command (e.g., 2026-01)
+python -m src.cli rank-riskiest --model-path data/processed/model_gbm.joblib --iso-year 2026 --iso-week 1
+
 ```
 
-* Fits the model on the `unit_week_features.parquet` dataset.
-* Saves the trained model to `data/processed/model.joblib`.
+### 3. Launch the Dashboard
 
-### 4. Evaluation
-
-Evaluate model performance (precision, recall, AUC, etc.).
+Visualize the active Red Zones on a 3D map.
 
 ```bash
-make eval
+streamlit run src/app.py
+
 ```
 
-### 5. Visualization
+---
 
-Generate static plots and maps.
+## 📊 Model Performance
 
-```bash
-make figs
-```
+The model was evaluated using **Time-Block Cross-Validation** (strict temporal separation) to simulate real-world deployment.
 
-* **Lag Curves**: Visualizes how risk responds to weather variables over time (`docs/figures_lag/`).
-* **Interactions**: Visualizes 3D surfaces for variable interactions (`docs/figures_interaction/`).
-* **Maps**: Generates hindcast risk maps for specific weeks (`docs/maps/`).
+| Metric | Result (Outbreak Years) | Meaning |
+| --- | --- | --- |
+| **ROC AUC** | **0.9375** | Excellent ability to distinguish safe vs. dangerous zones globally. |
+| **Average Precision** | **0.9950** | Extremely high reliability in risk scoring. |
+| **Precision @ 20** | **1.0000** | **100% Hit Rate.** In historical validation, every single one of the Top 20 zones flagged by the model contained an active cluster. |
 
-### 6. Dashboard
+*Evaluation performed on 2017–2020 data.*
 
-Run the interactive Streamlit dashboard.
+---
 
-```bash
-make app
-```
+## 🛠️ Engineering Pipeline
 
-## CLI Reference
+The system uses a modular ETL pipeline managed by `src.cli`:
 
-The project exposes a rich Command Line Interface (CLI) via `src/cli.py`. You can access detailed help for any command:
+1. **Ingest:**
+* `download-weather`: Scrapes MSS daily weather data.
+* `ingest-nea-live`: Fetches active clusters from Data.gov.sg.
 
-```bash
-python -m src.cli --help
-```
 
-**Key Commands:**
+2. **Process (`build-features`):**
+* Calculates **Spatiotemporal Lags** (e.g., `neighbor_pressure_lag_1`).
+* Aggregates weather (Rain, Temp, Humidity) to weekly H3 resolutions.
 
-* `ingest-archive`: Merge SGCharts snapshots.
-* `ingest-weather`: Process daily weather files.
-* `ingest-moh`: Parse MOH weekly bulletin PDFs/CSVs.
-* `ingest-nea-live`: Archive today's live NEA clusters.
-* `fit-panel-logit`: Train the main model.
-* `cv-panel-logit`: Run year-block cross-validation.
-* `map-hindcast`: Generate a risk map for a specific ISO week.
 
-## Development
+3. **Model (`fit-gbm`):**
+* Trains a `LGBMClassifier` with `CalibratedClassifierCV` (Isotonic) to ensure risk scores are realistic probabilities (0–100%).
 
-* **Linting**: Check code quality.
-```bash
-make lint
-```
 
-* **Formatting**: Auto-format code.
-```bash
-make fmt
-```
 
-* **Testing**: Run unit tests.
-```bash
-make test
-```
+---
 
-## Project Structure
+## 📂 Project Structure
 
 ```text
-├── config/                 # Configuration files
-├── dashboard/              # Streamlit application
-├── data/                   # Data directory (raw, interim, processed)
-├── docs/                   # Documentation and generated figures
-├── scripts/                # Standalone utility scripts
+.
+├── data/
+│   ├── raw/                # MSS Weather & NEA GeoJSONs
+│   ├── interim/            # Parquet checkpoints
+│   └── processed/          # Final feature tables & trained models
 ├── src/
-│   └── dengueweather/      # Main package source code
-│       ├── build/          # Feature engineering logic
-│       ├── ingest/         # Data fetching and parsing
-│       ├── model/          # Model training and evaluation
-│       └── viz/            # Visualization modules
-└── pyproject.toml          # Project metadata and dependencies
+│   ├── app.py              # Streamlit Command Center
+│   ├── cli.py              # The "Controller" (CLI commands)
+│   └── dengueweather/
+│       ├── build/          # Feature Engineering logic
+│       └── model/          # LightGBM training & inference code
+└── pyproject.toml          # Dependencies
+
 ```
+
+---
+
+## 🔮 Future Upgrades
+
+* **Automated Cron Job:** GitHub Action to run the pipeline every Monday at 0800H.
+* **Explainable AI:** Integrate SHAP values into the dashboard to explain *why* a specific block is high risk (e.g., "High Rain 2 weeks ago + Neighbor Infection").
