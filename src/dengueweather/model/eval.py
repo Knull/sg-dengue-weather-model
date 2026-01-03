@@ -16,7 +16,7 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import GroupKFold
 from sklearn.preprocessing import StandardScaler
-
+from sklearn.calibration import CalibratedClassifierCV
 LABEL_COL = "y_cluster_present"
 EXCLUDE_COLS = {
     "h3",
@@ -182,9 +182,8 @@ def spatial_block_cv(
 
     return pd.DataFrame(rows)
 
-
 def _train_eval_fold(train_df, test_df, feature_cols, model_params):
-    """Helper to train and evaluate a single fold."""
+    """Helper to train and evaluate a single fold with Calibration."""
     X_tr = train_df[feature_cols].fillna(0.0).astype("float64").values
     y_tr = train_df[LABEL_COL].astype(int).values
     X_te = test_df[feature_cols].fillna(0.0).astype("float64").values
@@ -204,7 +203,13 @@ def _train_eval_fold(train_df, test_df, feature_cols, model_params):
         p_te = np.full(len(y_te), const_pred, dtype=float)
         metrics = compute_basic_metrics(y_te, p_te)
     else:
-        clf = LogisticRegression(**params)
+        # Wrap the base model with calibration for CV
+        base_clf = LogisticRegression(**params)
+        
+        # Use a smaller internal CV (e.g., 3) for calibration inside the fold 
+        # to save time and data
+        clf = CalibratedClassifierCV(estimator=base_clf, method="isotonic", cv=3)
+        
         clf.fit(X_tr, y_tr)
         p_te = clf.predict_proba(X_te)[:, 1]
         metrics = compute_basic_metrics(y_te, p_te)

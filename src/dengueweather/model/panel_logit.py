@@ -1,3 +1,4 @@
+# src/dengueweather/model/panel_logit.py
 """Panel logistic regression utilities."""
 
 from pathlib import Path
@@ -8,6 +9,7 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
+from sklearn.calibration import CalibratedClassifierCV  # <--- NEW IMPORT
 from sklearn.metrics import roc_auc_score, average_precision_score
 from sklearn.preprocessing import StandardScaler
 
@@ -26,6 +28,7 @@ EXCLUDE_COLS = {
     "week_of_year",
     "woy_sin",
     "woy_cos",
+    "spatial_block"
 }
 
 def _select_numeric_feature_cols(df: pd.DataFrame) -> list[str]:
@@ -40,9 +43,10 @@ def fit_model(
     *,
     class_weight: Optional[str | Dict[int, float]] = "balanced",
     max_iter: int = 2000,
+    calibration_cv: int = 5,  # <--- NEW PARAMETER
     **model_kwargs: object,
 ) -> None:
-    """Fit a scaled logistic regression on numeric features and save it."""
+    """Fit a calibrated logistic regression on numeric features and save it."""
     setup_logging()
     df = pd.read_parquet(features_path)
     if LABEL_COL not in df:
@@ -59,12 +63,23 @@ def fit_model(
     Xs = scaler.fit_transform(X)
 
     cw = "balanced" if class_weight == "balanced" else (class_weight if isinstance(class_weight, dict) else None)
-    model = LogisticRegression(max_iter=max_iter, class_weight=cw, **model_kwargs)
+    
+    # 1. Create Base Model
+    base_model = LogisticRegression(max_iter=max_iter, class_weight=cw, **model_kwargs)
+    
+    # 2. Wrap with Isotonic Calibration
+    # We use CV to ensure the calibrator doesn't overfit the training set
+    model = CalibratedClassifierCV(
+        estimator=base_model,
+        method="isotonic",
+        cv=calibration_cv
+    )
+    
     model.fit(Xs, y)
 
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     joblib.dump({"model": model, "feature_cols": feature_cols, "scaler": scaler}, out)
-    print(f"model: trained on {len(X):,} rows, {len(feature_cols)} features → {out}")
+    print(f"model: trained calibrated model on {len(X):,} rows, {len(feature_cols)} features → {out}")
 
 def eval_model(model_path: str, features_path: str, out: str) -> None:
     """Compute evaluation metrics using saved scaler + features."""
@@ -82,7 +97,7 @@ def eval_model(model_path: str, features_path: str, out: str) -> None:
     y_pred_proba = model.predict_proba(Xs)[:, 1]
     auc = roc_auc_score(y, y_pred_proba)
     ap = average_precision_score(y, y_pred_proba)
-    metrics = {"roc_auc": float(auc), "average_precision": float(ap)} # eval: {'roc_auc': 0.9621794871794871, 'average_precision': 0.9972520005321366} → data/processed/metrics.json (outputs)
+    metrics = {"roc_auc": float(auc), "average_precision": float(ap)}
 
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w") as fh:
