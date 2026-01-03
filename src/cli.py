@@ -23,7 +23,7 @@ from dengueweather.model.eval import year_block_cv, spatial_block_cv # Added spa
 from dengueweather.viz.lag_curves import plot_lag_curves
 from dengueweather.viz.interaction_surfaces import plot_interaction
 from dengueweather.viz.maps import map_hindcast
-
+from dengueweather.model.panel_gbm import fit_gbm, eval_gbm
 
 app = typer.Typer(add_completion=False, help="Dengue-weather command-line interface")
 
@@ -347,7 +347,8 @@ def rank_riskiest(
     payload = joblib.load(model_path)
     model = payload["model"]
     feature_cols = payload["feature_cols"]
-    scaler = payload["scaler"]
+    # Handle models with or without scalers (LightGBM doesn't use one)
+    scaler = payload.get("scaler") 
     
     # Load Data
     df = pd.read_parquet(features_path)
@@ -358,9 +359,14 @@ def rank_riskiest(
         raise typer.Exit(1)
         
     # Predict
+    # Ensure columns match exactly what the model was trained on
     X = subset[feature_cols].fillna(0.0).astype("float64").values
-    Xs = scaler.transform(X)
-    probs = model.predict_proba(Xs)[:, 1]
+    
+    # Apply scaling only if the model requires it (e.g. Logistic Regression)
+    if scaler:
+        X = scaler.transform(X)
+        
+    probs = model.predict_proba(X)[:, 1]
     
     subset["risk_score"] = probs
     
@@ -381,7 +387,8 @@ def rank_riskiest(
     
     if out:
         ranked.to_csv(out, index=False)
-        typer.echo(f"Saved to {out}")
+        typer.echo(f"Saved to {out}")    
+
 @app.command("plot-lag-curves")
 def plot_lag_curves_cmd(
     model_path: str = typer.Option(
@@ -443,7 +450,32 @@ def map_hindcast_cmd(
     feat_path = features_path or str(Path(cfg.data["processed_dir"]) / "unit_week_features.parquet")
     map_hindcast(model_path, out_dir, features_path=feat_path, iso_year=iso_year, iso_week=iso_week)
 
+@app.command("fit-gbm")
+def fit_gbm_cmd(
+    features_path: str = typer.Option(
+        "data/processed/unit_week_features.parquet",
+        help="Path to feature table (ensure it has spatial lags!)"
+    ),
+    out_path: str = typer.Option(
+        "data/processed/model_gbm.joblib",
+        help="Path to save the LightGBM model"
+    ),
+    n_estimators: int = 500,
+) -> None:
+    """
+    Train the advanced Gradient Boosting Machine (LightGBM) model.
+    This model uses spatial lags and non-linear weather interactions.
+    """
+    fit_gbm(features_path, out_path, n_estimators=n_estimators)
 
+@app.command("eval-gbm")
+def eval_gbm_cmd(
+    model_path: str = typer.Option("data/processed/model_gbm.joblib"),
+    features_path: str = typer.Option("data/processed/unit_week_features.parquet"),
+    out: str = typer.Option("data/processed/metrics_gbm.json")
+) -> None:
+    """Evaluate the GBM model."""
+    eval_gbm(model_path, features_path, out)
 def main() -> None:
     """Entry point for ``python -m src.cli``."""
     app()

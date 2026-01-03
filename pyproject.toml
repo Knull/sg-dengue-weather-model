@@ -22,7 +22,8 @@ dependencies = [
   "pydantic>=2.7",
   "matplotlib>=3.9",
   "beautifulsoup4>=4.12",
-  "pdfplumber>=0.11"
+  "pdfplumber>=0.11",
+  "lightgbm>=4.3"
 ]
 
 [project.optional-dependencies]
