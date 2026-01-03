@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Optional
+import datetime # Added for weather download
 
 import typer
 
@@ -13,11 +14,12 @@ from dengueweather.ingest.sgcharts_archive import merge_archive
 from dengueweather.ingest.mss_weather import weekly_from_dir
 from dengueweather.ingest.moh_weekly_cases import load_weekly_counts, append_pdf_weeks
 from dengueweather.ingest.nea_live_archiver import archive_today
+from dengueweather.ingest.weather_client import MSSWeatherClient # Added import
 from dengueweather.build.cluster_history import build_history, build_cluster_week
 from dengueweather.build.features import build_features
 from dengueweather.model.panel_logit import fit_model as fit_panel_logit
 from dengueweather.model.panel_logit import eval_model as eval_panel_logit
-from dengueweather.model.eval import year_block_cv
+from dengueweather.model.eval import year_block_cv, spatial_block_cv # Added spatial_block_cv
 from dengueweather.viz.lag_curves import plot_lag_curves
 from dengueweather.viz.interaction_surfaces import plot_interaction
 from dengueweather.viz.maps import map_hindcast
@@ -26,6 +28,46 @@ from dengueweather.viz.maps import map_hindcast
 app = typer.Typer(add_completion=False, help="Dengue-weather command-line interface")
 
 # INGESTION COMMANDS 👇
+
+@app.command("download-weather")
+def download_weather(
+    station_code: str = typer.Option("S24", help="MSS Station Code (e.g. S24 for Changi)"),
+    start_year: int = typer.Option(2012, help="Start year"),
+    end_year: Optional[int] = typer.Option(None, help="End year (default: current year)"),
+    out_dir: str = typer.Option("data/raw/mss_weather/daily", help="Directory to save CSVs")
+) -> None:
+    """
+    Download historical daily weather data using the engineered MSS client.
+    
+    This command fetches daily CSV records from the MSS archive, handling retries
+    and session management automatically.
+    """
+    if end_year is None:
+        end_year = datetime.date.today().year
+
+    # Ensure output directory exists specific to station
+    target_dir = Path(out_dir) / station_code
+    
+    typer.echo(f"Initializing Weather API Client for station {station_code} ({start_year}-{end_year})...")
+    
+    with MSSWeatherClient() as client:
+        count = 0
+        for year in range(start_year, end_year + 1):
+            for month in range(1, 13):
+                # Don't fetch future months
+                if datetime.date(year, month, 1) > datetime.date.today():
+                    break
+                
+                try:
+                    path = client.download_month(station_code, year, month, target_dir)
+                    if path:
+                        count += 1
+                except Exception as e:
+                    typer.secho(f"Failed to fetch {year}-{month}: {e}", fg=typer.colors.RED)
+    
+    typer.echo(f"Finished. Downloaded {count} files to {target_dir}")
+
+
 @app.command("ingest-archive")
 def ingest_archive(
     input_dir: str = typer.Argument(..., help="Directory containing SGCharts CSV snapshots"),
@@ -249,7 +291,7 @@ def cv_panel_logit_cmd(
     ),
     n_splits: int = typer.Option(
         3,
-        help="Number of folds in year-block cross-validation",
+        help="Number of folds in cross-validation",
     ),
     out: str = typer.Option(
         "data/processed/cv_metrics.parquet",
@@ -263,13 +305,23 @@ def cv_panel_logit_cmd(
         None,
         help="Class weight spec passed to scikit-learn (e.g. 'balanced').",
     ),
+    mode: str = typer.Option(
+        "temporal",
+        help="CV mode: 'temporal' (year-block) or 'spatial' (block/subzone)"
+    )
 ) -> None:
-    """Perform year-block cross-validation on the panel logistic model."""
-    # Use year-block cross-validation from model.eval; returns a DataFrame
-    df_cv = year_block_cv(features_path, n_splits=n_splits, model_params={"max_iter": max_iter, "class_weight": class_weight})
+    """Perform cross-validation on the panel logistic model."""
+    params = {"max_iter": max_iter, "class_weight": class_weight}
+    
+    if mode == "spatial":
+        # Note: requires a 'subzone_id' or similar column, or falls back to H3 parents
+        df_cv = spatial_block_cv(features_path, n_splits=n_splits, model_params=params)
+    else:
+        df_cv = year_block_cv(features_path, n_splits=n_splits, model_params=params)
+
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     df_cv.to_parquet(out, index=False)
-    typer.echo(f"Wrote CV metrics to {out}")
+    typer.echo(f"Wrote {mode} CV metrics to {out}")
 
 
 # VISUALIZATION COMMANDS
