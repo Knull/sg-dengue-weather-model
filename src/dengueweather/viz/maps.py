@@ -37,40 +37,6 @@ _SUBZONE_CANDIDATES: List[str] = [
 ]
 
 def _find_subzone_col(gdf: gpd.GeoDataFrame) -> str:
-    """Identify the column in a GeoDataFrame that contains the subzone name.
-
-    This helper tries several strategies to discover a usable subzone name
-    column:
-
-      1. Look for a known subzone column (case‑insensitive) from a small set
-         of expected names (e.g. ``SUBZONE_N``, ``SUBZONE_NAME``).
-      2. Fallback to any column whose name contains ``subzone`` (again
-         case‑insensitive) and is not an identifier like ``subzone_no``.
-      3. Parse the ``Description`` column (case‑insensitive) if present.  Many
-         URA downloads include an HTML blob here with rows of ``<th>``/``<td>``
-         pairs.  We search for any candidate label inside the ``<th>`` tag and
-         extract the corresponding value from the following ``<td>``.  The
-         extracted values are assigned to a new column on the GeoDataFrame.
-
-    If none of these strategies succeed a ``ValueError`` is raised with the
-    available column names.  The function will mutate the provided
-    GeoDataFrame when it needs to create a new column from the Description.
-
-    Parameters
-    ----------
-    gdf : geopandas.GeoDataFrame
-        The GeoDataFrame to inspect and potentially augment.
-
-    Returns
-    -------
-    str
-        The name of the column containing subzone names.
-
-    Raises
-    ------
-    ValueError
-        If a subzone column cannot be identified or extracted.
-    """
     # 1) exact matches (case‑insensitive).  Use the actual column name if a
     # candidate matches ignoring case.  Avoid returning ``Name`` because that
     # often contains a file section identifier rather than a true subzone.
