@@ -51,7 +51,12 @@ def build_history(in_path: str, out_path: str) -> None:
     print(f"history: {len(g)} clusters → {out_path}")
 
 
-def build_cluster_week(history_path: str, out_path: str, h3_res: int | None = None) -> None:
+def build_cluster_week(
+    history_path: str,
+    out_path: str,
+    h3_res: int | None = None,
+    archive_path: str | None = None,
+) -> None:
     if h3 is None:
         raise RuntimeError("h3 package is required for build_cluster_week. Install `h3`.")
 
@@ -62,41 +67,64 @@ def build_cluster_week(history_path: str, out_path: str, h3_res: int | None = No
     cfg = load_config()
     res = h3_res if h3_res is not None else int(cfg.project.get("h3_res", 8))
 
-    # For each cluster, enumerate ISO weeks it was active
-    def _weeks_for_row(r: pd.Series) -> pd.DataFrame:
-        rng = pd.date_range(r["first_seen"], r["last_seen"], freq="D")
-        if rng.empty:
-            return pd.DataFrame(columns=["cluster_key", "h3", "iso_year", "iso_week"])
-        wk = pd.DataFrame({"date": rng})
-        iso = wk["date"].dt.isocalendar()
-        wk["iso_year"] = iso.year.astype(int)
-        wk["iso_week"] = iso.week.astype(int)
-        wk = wk.drop_duplicates(["iso_year", "iso_week"])
-        wk["cluster_key"] = r["cluster_key"]
-        wk["h3"] = h3.geo_to_h3(float(r["lat"]), float(r["lon"]), res)
-        return wk[["cluster_key", "h3", "iso_year", "iso_week"]]
+    # Use raw snapshots (not interpolated first_seen->last_seen ranges) to
+    # determine which weeks each cluster was actually active. Avoids treating
+    # gaps of months/years between sparse snapshots as continuous activity.
+    if archive_path is None:
+        archive_path = "data/interim/archive_merged.parquet"
+    arch = pd.read_parquet(archive_path)
+    if arch.empty:
+        raise SystemExit(f"archive at {archive_path} is empty - did ingest-archive run?")
 
-    parts = []
-    for _, r in hist.iterrows():
-        parts.append(_weeks_for_row(r))
+    arch = arch.copy()
+    arch["snapshot_date"] = pd.to_datetime(arch["snapshot_date"])
+    iso = arch["snapshot_date"].dt.isocalendar()
+    arch["iso_year"] = iso.year.astype(int)
+    arch["iso_week"] = iso.week.astype(int)
 
-    cw = pd.concat(parts, ignore_index=True)
+    # Per-snapshot lat/lon if present; otherwise fall back to cluster median
+    if "lat" not in arch.columns or "lon" not in arch.columns:
+        arch = arch.merge(hist[["cluster_key", "lat", "lon"]], on="cluster_key", how="left")
+    else:
+        arch = arch.merge(
+            hist[["cluster_key", "lat", "lon"]].rename(
+                columns={"lat": "_lat_med", "lon": "_lon_med"}
+            ),
+            on="cluster_key", how="left",
+        )
+        arch["lat"] = arch["lat"].fillna(arch["_lat_med"])
+        arch["lon"] = arch["lon"].fillna(arch["_lon_med"])
+
+    arch = arch.dropna(subset=["lat", "lon"])
+    arch["h3"] = [
+        h3.geo_to_h3(float(la), float(lo), res)
+        for la, lo in zip(arch["lat"], arch["lon"])
+    ]
+
+    cw = (
+        arch[["cluster_key", "h3", "iso_year", "iso_week"]]
+        .drop_duplicates()
+        .reset_index(drop=True)
+    )
     cw["y_cluster_present"] = 1
 
-    keep = ["cluster_key", "peak_cases", "first_seen", "last_seen", "left_censored", "right_censored"]
+    keep = ["cluster_key", "peak_cases", "first_seen", "last_seen",
+            "left_censored", "right_censored"]
     cw = cw.merge(hist[keep], on="cluster_key", how="left")
 
-    # Build full panel across all observed weeks and H3s that ever had a cluster
+    # Build full panel across all observed weeks and H3 cells that ever had a cluster
     weeks = cw[["iso_year", "iso_week"]].drop_duplicates()
-    h3s   = cw[["h3"]].drop_duplicates()
+    h3s = cw[["h3"]].drop_duplicates()
     panel = weeks.merge(h3s, how="cross")
     panel = panel.merge(
-        cw[["h3", "iso_year", "iso_week", "y_cluster_present", "peak_cases", "first_seen", "last_seen",
-            "left_censored", "right_censored"]],
-        on=["h3", "iso_year", "iso_week"], how="left"
+        cw[["h3", "iso_year", "iso_week", "y_cluster_present", "peak_cases",
+            "first_seen", "last_seen", "left_censored", "right_censored"]],
+        on=["h3", "iso_year", "iso_week"], how="left",
     )
     panel["y_cluster_present"] = panel["y_cluster_present"].fillna(0).astype(int)
+    # Multiple clusters can share (h3, year, week) — dedupe to one row
+    panel = panel.drop_duplicates(subset=["h3", "iso_year", "iso_week"], keep="first")
 
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     panel.to_parquet(out_path, index=False)
-    print(f"cluster-week: {len(panel):,} rows → {out_path}")
+    print(f"cluster-week: {len(panel):,} rows -> {out_path}")

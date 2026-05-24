@@ -1,4 +1,4 @@
-# 🦟 Singapore Dengue Tactical Response Model
+# Singapore Dengue Tactical Response Model
 
 A high-precision, spatiotemporal forecasting system designed to identify active dengue clusters in Singapore before they expand.
 
@@ -11,7 +11,7 @@ Unlike traditional weather-only models, this system calculates **Spatial Infecti
 
 ---
 
-## 🎯 The Goal: Save as many people.
+## The Goal: Save as many people.
 To prevent outbreaks, broad "risk maps" are insufficient. Resources are finite. This model answers one specific question:
 > **"Which 20 specific neighborhoods (H3 Hexagons) require boots-on-the-ground intervention *today*?"**
 
@@ -23,7 +23,7 @@ To prevent outbreaks, broad "risk maps" are insufficient. Resources are finite. 
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### 1. Installation
 Clone the repo and install dependencies (including `lightgbm`, `h3`, `pydeck`).
@@ -63,21 +63,37 @@ streamlit run src/app.py
 
 ---
 
-## 📊 Model Performance
+## Model Performance
 
-The model was evaluated using **Time-Block Cross-Validation** (strict temporal separation) to simulate real-world deployment.
+7-fold walk-forward CV on 2013–2020 NEA archive (train strictly precedes test):
 
-| Metric | Result (Outbreak Years) | Meaning |
-| --- | --- | --- |
-| **ROC AUC** | **0.9375** | Excellent ability to distinguish safe vs. dangerous zones globally. |
-| **Average Precision** | **0.9950** | Extremely high reliability in risk scoring. |
-| **Precision @ 20** | **1.0000** | **100% Hit Rate.** In historical validation, every single one of the Top 20 zones flagged by the model contained an active cluster. |
-
+| Test Year | ROC AUC | AP | P@20 |
+| --- | --- | --- | --- |
+| 2014 | 0.66 | 0.22 | 0.37 |
+| 2015 | 0.72 | 0.28 | 0.49 |
+| 2016 | 0.74 | 0.45 | 0.59 |
+| 2017 | 0.68 | 0.13 | 0.16 |
+| 2018 | 0.75 | 0.19 | 0.23 |
+| 2019 | 0.81 | 0.52 | 0.69 |
+| 2020 | 0.72 | 0.33 | 0.71 |
+| **Mean** | **0.73** | **0.31** | **0.46** |
 *Evaluation performed on 2017–2020 data.*
 
 ---
 
-## 🛠️ Engineering Pipeline
+## Limitations
+- **Target is cluster presence, not new-cluster onset.** Active clusters
+  persist for multiple weeks, so part of the signal reflects last-week
+  carryover rather than true forecasting of new outbreaks.
+- **Archive coverage varies.** Positive-rate by year ranges from 2% (2017)
+  to 17% (2019); low-positive years may reflect transmission lulls or
+  gaps in the SGCharts/NEA archive ingest, and per-fold metrics should
+  be read in that light.
+- **No data 2021–present.** The current archive has no positive labels
+  after 2020; the live patching engine has not been validated against
+  out-of-sample 2022 outbreak data.
+---
+## Engineering Pipeline
 
 The system uses a modular ETL pipeline managed by `src.cli`:
 
@@ -98,7 +114,7 @@ The system uses a modular ETL pipeline managed by `src.cli`:
 
 ---
 
-## 📂 Project Structure
+## Project Structure
 
 ```text
 .
@@ -118,7 +134,7 @@ The system uses a modular ETL pipeline managed by `src.cli`:
 
 ---
 
-## 🔮 Future Upgrades
+## Future Upgrades
 
 * **Automated Cron Job:** GitHub Action to run the pipeline every Monday at 0800H.
 * **Explainable AI:** Integrate SHAP values into the dashboard to explain *why* a specific block is high risk (e.g., "High Rain 2 weeks ago + Neighbor Infection").

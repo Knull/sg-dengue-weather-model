@@ -24,7 +24,14 @@ EXCLUDE_COLS = {
     "peak_cases",
     "left_censored",
     "right_censored",
-    "spatial_block"
+    "spatial_block",
+    "rain_mm",
+    "temp_c",
+    "rh_pct",
+    "wind_kmh",
+    "abs_humidity_gm3",
+    "iso_year",
+    "self_lag_1",
 }
 # Note: We keep 'h3' (as category) and 'iso_year'/'iso_week' in exclusion usually, 
 # but LightGBM can handle 'week_of_year' explicitly if passed.
@@ -137,23 +144,24 @@ def eval_gbm(model_path: str, features_path: str, out: str) -> None:
         json.dump(metrics, fh, indent=2)
     print(f"GBM Evaluation: {metrics} -> {out}")
 
-# In src/dengueweather/model/panel_gbm.py (or wherever you put run_cv)
-
 def run_cv(
     features_path: str,
     out: str,
-    n_splits: int = 3
+    n_splits: int = 3,  # kept for CLI compatibility; ignored in walk-forward
 ) -> None:
-    """Run temporal cross-validation, strictly ignoring years with no data."""
+    """Run walk-forward temporal cross-validation.
+
+    For each test year (from the 2nd valid year onward), train ONLY on years
+    strictly before it. No future leakage.
+    """
     setup_logging()
     print(f"Loading features from {features_path}...")
     df = pd.read_parquet(features_path).fillna(0)
 
-    # 1. Filter for years that actually have clusters (targets)
-    # If a year has 0 positive labels, it's likely missing data, not a 'miracle year'.
+    # 1. Filter for years that actually have positive labels.
     valid_years = []
     all_years = sorted(df["iso_year"].unique())
-    
+
     for year in all_years:
         n_pos = df[df["iso_year"] == year][LABEL_COL].sum()
         if n_pos > 0:
@@ -161,35 +169,28 @@ def run_cv(
         else:
             print(f"[Warn] Excluding year {year} from CV (0 positive labels found).")
 
-    if len(valid_years) < n_splits:
-        print(f"Error: Not enough valid labeled years ({len(valid_years)}) for {n_splits} splits.")
+    if len(valid_years) < 2:
+        print(f"Error: Need at least 2 valid labeled years for walk-forward CV (got {len(valid_years)}).")
         return
 
-    # Filter dataframe to only valid years
     df = df[df["iso_year"].isin(valid_years)].copy()
-    print(f"Running CV on valid years: {valid_years}")
+    print(f"Running walk-forward CV on valid years: {valid_years}")
 
-    # 2. Create contiguous blocks
-    block_size = len(valid_years) // n_splits
-    test_blocks = []
-    for i in range(n_splits):
-        start = i * block_size
-        # Last block takes the remainder
-        end = (i + 1) * block_size if i < n_splits - 1 else len(valid_years)
-        test_blocks.append(valid_years[start:end])
-
+    # 2. Walk-forward folds: skip earliest year (nothing to train on).
     feature_cols = _select_feature_cols(df)
+    print(f"Using {len(feature_cols)} features.")
     results = []
 
-    print(f"\nStarting {n_splits}-fold Time-Series CV...")
+    test_years_list = valid_years[1:]
+    print(f"\nStarting walk-forward CV across {len(test_years_list)} folds...")
 
-    for i, test_years in enumerate(test_blocks):
-        print(f"Fold {i+1}/{n_splits}: Testing on years {test_years}")
-        
-        # Split Data
-        train_mask = ~df["iso_year"].isin(test_years)
-        test_mask = df["iso_year"].isin(test_years)
-        
+    for i, test_year in enumerate(test_years_list):
+        train_years = [y for y in valid_years if y < test_year]
+        print(f"Fold {i+1}/{len(test_years_list)}: train={train_years}, test={test_year}")
+
+        train_mask = df["iso_year"].isin(train_years)
+        test_mask = df["iso_year"] == test_year
+
         X_tr = df.loc[train_mask, feature_cols].values
         y_tr = df.loc[train_mask, LABEL_COL].astype(int).values
         X_te = df.loc[test_mask, feature_cols].values
@@ -199,10 +200,9 @@ def run_cv(
             print("  Skipping fold (only 1 class in training).")
             continue
         if len(np.unique(y_te)) < 2:
-            print(f"  Skipping fold (only 1 class in test set for years {test_years}).")
+            print(f"  Skipping fold (only 1 class in test for year {test_year}).")
             continue
 
-        # Train Base Model
         base = lgb.LGBMClassifier(
             n_estimators=500,
             learning_rate=0.05,
@@ -210,47 +210,42 @@ def run_cv(
             class_weight="balanced",
             random_state=42,
             n_jobs=-1,
-            verbose=-1
+            verbose=-1,
         )
-        
-        # Calibrate
         calibrated = CalibratedClassifierCV(base, method="isotonic", cv=3)
         calibrated.fit(X_tr, y_tr)
-        
-        # Predict
         probs = calibrated.predict_proba(X_te)[:, 1]
-        
-        # Metrics
+
         auc = roc_auc_score(y_te, probs)
         ap = average_precision_score(y_te, probs)
-        
-        # Calculate Top-20 Precision for this fold
+
         fold_df = df.loc[test_mask, ["iso_year", "iso_week", LABEL_COL]].copy()
         fold_df["pred"] = probs
-        
         precisions = []
         for _, wk_df in fold_df.groupby(["iso_year", "iso_week"]):
             if wk_df[LABEL_COL].sum() > 0:
                 top_20 = wk_df.sort_values("pred", ascending=False).head(20)
                 precisions.append(top_20[LABEL_COL].mean())
-        
-        mean_p20 = np.mean(precisions) if precisions else 0.0
-        
-        print(f"  --> AUC: {auc:.4f}, AP: {ap:.4f}, Precision@20: {mean_p20:.4f}")
-        
+        mean_p20 = float(np.mean(precisions)) if precisions else 0.0
+
+        print(f"  --> AUC: {auc:.4f}, AP: {ap:.4f}, P@20: {mean_p20:.4f}")
         results.append({
             "fold": i + 1,
-            "test_years": str(test_years),
-            "roc_auc": auc,
-            "average_precision": ap,
-            "precision_at_20": mean_p20
+            "train_years": str(train_years),
+            "test_year": test_year,
+            "n_train": int(train_mask.sum()),
+            "n_test": int(test_mask.sum()),
+            "n_pos_test": int(y_te.sum()),
+            "roc_auc": float(auc),
+            "average_precision": float(ap),
+            "precision_at_20": mean_p20,
         })
 
     # Save summary
     res_df = pd.DataFrame(results)
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     res_df.to_csv(out, index=False)
-    
+
     if "tabulate" in sys.modules:
         print("\nCV Results Summary:")
         print(res_df.to_markdown(index=False))

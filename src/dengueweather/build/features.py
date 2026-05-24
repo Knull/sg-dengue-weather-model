@@ -106,14 +106,12 @@ def build_features(
     weeks["__key"] = 1
     panel = h3_df.merge(weeks, on="__key").drop(columns="__key")
 
-    if {"h3", "iso_year", "iso_week"}.issubset(cw.columns):
+    if {"h3", "iso_year", "iso_week", "y_cluster_present"}.issubset(cw.columns):
+        # cluster_week parquet already has proper 0/1 labels — use them directly
         pres = (
-            cw.groupby(["h3", "iso_year", "iso_week"])
-              .size()
-              .rename("y_cluster_present")
-              .reset_index()
+            cw[["h3", "iso_year", "iso_week", "y_cluster_present"]]
+              .drop_duplicates(subset=["h3", "iso_year", "iso_week"])
         )
-        pres["y_cluster_present"] = 1
         panel = panel.merge(pres, on=["h3", "iso_year", "iso_week"], how="left")
     else:
         panel["y_cluster_present"] = np.nan
