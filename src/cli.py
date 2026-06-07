@@ -382,8 +382,9 @@ def rank_riskiest(
     ranked = subset.sort_values("risk_score", ascending=False).head(top_k)
     
     # Display
-    columns_to_show = ["h3", "risk_score", "y_cluster_present"]
-    # Add coordinates if possible
+    columns_to_show = ["h3", "risk_score"]
+    if "y_cluster_present" in ranked.columns and ranked["y_cluster_present"].notna().any():
+        columns_to_show.append("y_cluster_present")    
     if "h3" in ranked.columns:
         import h3
         ranked["lat"] = ranked["h3"].apply(lambda x: h3.h3_to_geo(x)[0])
@@ -589,35 +590,48 @@ def patch_live_week(
         raise typer.Exit(1)
 
     # 2. Determine Forecast Week
-    target_date = datetime.date.today()
+    target_date = datetime.date.today() + datetime.timedelta(days=7)
     target_year, target_week, _ = target_date.isocalendar()
-    typer.echo(f"Targeting Forecast Week: {target_year}-W{target_week:02d}")
+    typer.echo(f"Targeting Ranking Week: {target_year}-W{target_week:02d}")
 
-    # 3. Get Latest Weather
+    # 3. Get latest available weather features
     df_sorted = df_feat.sort_values(["iso_year", "iso_week"])
     last_week = df_sorted.iloc[-1]
     last_year, last_iso = int(last_week["iso_year"]), int(last_week["iso_week"])
-    
-    # Filter grid
+
     grid_df = df_feat[["h3"]].drop_duplicates().copy()
-    weather_source = df_sorted[(df_sorted["iso_year"] == last_year) & (df_sorted["iso_week"] == last_iso)].iloc[0]
-    
-    exclude_cols = {"h3", "iso_year", "iso_week", "y_cluster_present", "self_lag_1", "neighbor_pressure_lag_1"}
+    weather_source = df_sorted[
+        (df_sorted["iso_year"] == last_year) &
+        (df_sorted["iso_week"] == last_iso)
+    ].iloc[0]
+
+    exclude_cols = {
+        "h3",
+        "iso_year",
+        "iso_week",
+        "y_cluster_present",
+        "self_lag_1",
+        "neighbor_pressure_lag_1",
+    }
     keep_cols = [c for c in df_feat.columns if c not in exclude_cols]
-    
+
     new_week_df = grid_df.copy()
     new_week_df["iso_year"] = target_year
     new_week_df["iso_week"] = target_week
-    
+
     for c in keep_cols:
         if c in weather_source:
             new_week_df[c] = weather_source[c]
-            
-    # 4. Fill Cluster Features
-    new_week_df["y_cluster_present"] = new_week_df["h3"].apply(lambda x: 1 if x in live_h3s else 0)
-    new_week_df["self_lag_1"] = new_week_df["y_cluster_present"]
-    
+
+    # 4. Fill lagged cluster features from the latest observed live clusters.
+    # The target label for the ranking week is unknown.
+    new_week_df["y_cluster_present"] = pd.NA
+    new_week_df["self_lag_1"] = new_week_df["h3"].apply(
+        lambda x: 1 if x in live_h3s else 0
+    )
+
     h3_set = set(live_h3s)
+
     def get_pressure(h):
         return sum(1 for k in h3.k_ring(h, 1) if k in h3_set)
 
@@ -628,8 +642,7 @@ def patch_live_week(
     final_df = pd.concat([df_clean, new_week_df], ignore_index=True)
     final_df.to_parquet(out, index=False)
     
-    typer.echo(f"Success. Wrote {len(new_week_df)} rows for {target_year}-W{target_week:02d} to {out}")
-
+    typer.echo(f"Success. Wrote {len(new_week_df)} ranking rows for {target_year}-W{target_week:02d} to {out}")
 def main() -> None:
     """Entry point for ``python -m src.cli``."""
     app()

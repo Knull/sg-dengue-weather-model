@@ -1,8 +1,8 @@
-# Singapore Dengue Tactical Response Model
+# Singapore Dengue Risk Ranking Model
 
-A high-precision, spatiotemporal forecasting system designed to identify active dengue clusters in Singapore before they expand.
+A research prototype for ranking geographic areas in Singapore by dengue cluster-presence risk using weather, spatial, and temporal features.
 
-Unlike traditional weather-only models, this system calculates **Spatial Infection Pressure** (the "spark") alongside environmental suitability (the "fuel") to generate tactical intervention lists for NEA/Town Councils.
+The project studies whether recent cluster history, neighbouring cluster pressure, and lagged weather variables can improve weekly risk ranking over weather-only baselines. It should be read as an experimental modelling pipeline rather than an operational public-health decision tool.
 
 ![Python](https://img.shields.io/badge/Python-3.11-blue)
 ![Model](https://img.shields.io/badge/Model-LightGBM-green)
@@ -11,106 +11,115 @@ Unlike traditional weather-only models, this system calculates **Spatial Infecti
 
 ---
 
-## The Goal: Save as many people.
-To prevent outbreaks, broad "risk maps" are insufficient. Resources are finite. This model answers one specific question:
-> **"Which 20 specific neighborhoods (H3 Hexagons) require boots-on-the-ground intervention *today*?"**
+## Goal
+
+The goal is to generate weekly ranked lists of H3 zones for retrospective evaluation and prospective monitoring. The model ranks areas by estimated active-cluster risk using spatial cluster-pressure features, weather lags, and seasonal information.
+
+The current target is active cluster presence. Active dengue clusters can persist across weeks, so some of the signal comes from recent cluster carryover rather than the first appearance of new clusters. The results should therefore be interpreted as risk-ranking evidence for this specific target.
 
 ### Key Features
-* **Spatial Intelligence:** Uses H3 Hierarchical Geospatial Indexing to measure "Infection Pressure" from neighboring zones.
-* **Non-Linear Modeling:** Powered by a Calibrated **LightGBM** (Gradient Boosting Machine) to capture complex weather-lag interactions.
-* **Live "Patching" Engine:** Combines live NEA cluster data (via API) with persistence weather forecasts to predict risk for the *current* week.
-* **3D Command Dashboard:** Interactive Streamlit visualization for identifying risk towers on a street map.
+
+* **Spatial features:** Uses H3 geospatial indexing to measure cluster pressure from nearby zones.
+* **Nonlinear modelling:** Uses LightGBM with isotonic calibration for weather, temporal, and spatial features.
+* **Walk-forward validation:** Evaluates each test year using only earlier years for training.
+* **Live feature patching:** Supports a prospective monitoring workflow using the latest observed NEA cluster map as lagged spatial context.
+* **Dashboard:** Provides an interactive Streamlit map for inspecting ranked zones and model inputs.
 
 ---
 
 ## Quick Start
 
 ### 1. Installation
-Clone the repo and install dependencies (including `lightgbm`, `h3`, `pydeck`).
+
+Clone the repository and install dependencies.
 
 ```bash
-# Windows
 pip install -e .[dev]
-
 ```
 
-### 2. The "Weekly Tactical" Workflow
+### 2. Historical evaluation
 
-To generate the **Kill List** for the current week (e.g., Monday morning routine):
+Run walk-forward cross-validation on the processed historical feature table.
+
+```bash
+python -m src.cli cv-gbm
+```
+
+### 3. Prospective monitoring workflow
+
+Fetch the latest live cluster map and use it to patch the feature table for a prospective ranking week.
 
 ```bash
 # 1. Fetch the latest live cluster map from NEA
 python -m src.cli ingest-nea-live
 
-# 2. Patch the data (Merges Live Clusters + Latest Weather Forecast)
-# Replace the filename below with the one just downloaded in step 1
+# 2. Patch the feature table using the latest observed live clusters
+# Replace the filename below with the file just downloaded in step 1
 python -m src.cli patch-live-week --live-geojson data/raw/nea_live/2026-01-03.geojson
 
-# 3. Generate the Priority List (Top 20 Riskiest Zones)
-# Use the Forecast Week printed by the patch command (e.g., 2026-01)
+# 3. Generate the top-ranked zones
+# Use the year and week printed by the patch command
 python -m src.cli rank-riskiest --model-path data/processed/model_gbm.joblib --iso-year 2026 --iso-week 1
-
 ```
 
-### 3. Launch the Dashboard
-
-Visualize the active Red Zones on a 3D map.
+### 4. Launch the dashboard
 
 ```bash
 streamlit run src/app.py
-
 ```
 
 ---
 
 ## Model Performance
 
-7-fold walk-forward CV on 2013–2020 NEA archive (train strictly precedes test):
+Current walk-forward CV on valid labelled years in the 2013 to 2020 archive, with each test year trained only on previous years:
 
 | Test Year | ROC AUC | AP | P@20 |
-| --- | --- | --- | --- |
-| 2014 | 0.66 | 0.22 | 0.37 |
-| 2015 | 0.72 | 0.28 | 0.49 |
-| 2016 | 0.74 | 0.45 | 0.59 |
-| 2017 | 0.68 | 0.13 | 0.16 |
-| 2018 | 0.75 | 0.19 | 0.23 |
-| 2019 | 0.81 | 0.52 | 0.69 |
-| 2020 | 0.72 | 0.33 | 0.71 |
-| **Mean** | **0.73** | **0.31** | **0.46** |
-*Evaluation performed on 2017–2020 data.*
+| --- | ---: | ---: | ---: |
+| 2014 | 0.6600 | 0.2159 | 0.3714 |
+| 2015 | 0.7217 | 0.2793 | 0.4875 |
+| 2016 | 0.7424 | 0.4525 | 0.5902 |
+| 2017 | 0.6754 | 0.1318 | 0.1580 |
+| 2018 | 0.7507 | 0.1899 | 0.2317 |
+| 2019 | 0.8099 | 0.5177 | 0.6942 |
+| 2020 | 0.7179 | 0.3280 | 0.7111 |
+| **Mean** | **0.7254** | **0.3027** | **0.4634** |
+
+These results are for active cluster presence. Because active clusters persist over time, Precision@20 should be read as a ranking result for a persistence-influenced target rather than as a clean new-outbreak forecasting metric.
 
 ---
 
 ## Limitations
-- **Target is cluster presence, not new-cluster onset.** Active clusters
-  persist for multiple weeks, so part of the signal reflects last-week
-  carryover rather than true forecasting of new outbreaks.
-- **Archive coverage varies.** Positive-rate by year ranges from 2% (2017)
-  to 17% (2019); low-positive years may reflect transmission lulls or
-  gaps in the SGCharts/NEA archive ingest, and per-fold metrics should
-  be read in that light.
-- **No data 2021–present.** The current archive has no positive labels
-  after 2020; the live patching engine has not been validated against
-  out-of-sample 2022 outbreak data.
+
+- **Target definition:** The target is active cluster presence. It does not attempt to model new-cluster onset directly.
+- **Cluster persistence:** Part of the signal comes from recent self and neighbouring cluster activity.
+- **Archive coverage:** Positive-rate by year varies substantially. Low-positive years may reflect transmission lulls or gaps in the SGCharts and NEA archive ingest.
+- **Recent years:** The current archive has no positive labels after 2020, so the live monitoring workflow has not yet been validated on labelled post-2020 outcomes.
+- **Operational use:** The project is a research prototype. It should not be used for public-health intervention decisions without prospective validation, uncertainty analysis, and domain review.
+
 ---
+
 ## Engineering Pipeline
 
 The system uses a modular ETL pipeline managed by `src.cli`:
 
-1. **Ingest:**
-* `download-weather`: Scrapes MSS daily weather data.
-* `ingest-nea-live`: Fetches active clusters from Data.gov.sg.
+1. **Ingest**
+   * `download-weather`: Downloads historical MSS daily weather data.
+   * `ingest-archive`: Merges historical SGCharts or NEA archive snapshots.
+   * `ingest-nea-live`: Fetches the latest active cluster map from Data.gov.sg.
 
+2. **Process**
+   * `build-history`: Constructs stable cluster histories from archived snapshots.
+   * `build-cluster-week`: Converts cluster histories into weekly H3 labels.
+   * `build-features`: Builds weekly H3 features, including weather lags and spatial cluster-pressure features.
 
-2. **Process (`build-features`):**
-* Calculates **Spatiotemporal Lags** (e.g., `neighbor_pressure_lag_1`).
-* Aggregates weather (Rain, Temp, Humidity) to weekly H3 resolutions.
+3. **Model**
+   * `fit-gbm`: Trains a LightGBM classifier with isotonic calibration.
+   * `cv-gbm`: Runs walk-forward validation by test year.
+   * `rank-riskiest`: Produces a ranked list of H3 zones for a selected year and week.
 
-
-3. **Model (`fit-gbm`):**
-* Trains a `LGBMClassifier` with `CalibratedClassifierCV` (Isotonic) to ensure risk scores are realistic probabilities (0–100%).
-
-
+4. **Visualise**
+   * `streamlit run src/app.py`: Opens the dashboard for inspecting ranked zones and input features.
 
 ---
 
@@ -119,22 +128,25 @@ The system uses a modular ETL pipeline managed by `src.cli`:
 ```text
 .
 ├── data/
-│   ├── raw/                # MSS Weather & NEA GeoJSONs
+│   ├── raw/                # MSS weather files and NEA GeoJSONs
 │   ├── interim/            # Parquet checkpoints
-│   └── processed/          # Final feature tables & trained models
+│   └── processed/          # Feature tables and trained models
 ├── src/
-│   ├── app.py              # Streamlit Command Center
-│   ├── cli.py              # The "Controller" (CLI commands)
+│   ├── app.py              # Streamlit dashboard
+│   ├── cli.py              # Command-line interface
 │   └── dengueweather/
-│       ├── build/          # Feature Engineering logic
-│       └── model/          # LightGBM training & inference code
+│       ├── build/          # Feature engineering logic
+│       ├── ingest/         # Data ingestion utilities
+│       ├── model/          # Model training and evaluation code
+│       └── viz/            # Mapping and plotting utilities
 └── pyproject.toml          # Dependencies
-
 ```
 
 ---
 
-## Future Upgrades
+## Future Work
 
-* **Automated Cron Job:** GitHub Action to run the pipeline every Monday at 0800H.
-* **Explainable AI:** Integrate SHAP values into the dashboard to explain *why* a specific block is high risk (e.g., "High Rain 2 weeks ago + Neighbor Infection").
+* Add prospective validation once labelled outcomes are available for recent years.
+* Add SHAP or permutation-based explanations for top-ranked zones.
+* Separate active-cluster persistence from new-cluster onset in a future target definition.
+* Add uncertainty summaries for top-k rankings.

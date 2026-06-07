@@ -1,161 +1,211 @@
-import streamlit as st
+import h3
+import joblib
+import numpy as np
 import pandas as pd
 import pydeck as pdk
-import joblib
-import h3
-import numpy as np
+import streamlit as st
 from pathlib import Path
 
-# --- CONFIG ---
-PAGE_TITLE = "🦟 Dengue Response"
-feat_path = "data/processed/unit_week_features.parquet"
-model_path = "data/processed/model_gbm.joblib"
+
+PAGE_TITLE = "Dengue Risk Ranking"
+FEATURE_PATH = Path("data/processed/unit_week_features.parquet")
+MODEL_PATH = Path("data/processed/model_gbm.joblib")
 
 st.set_page_config(page_title=PAGE_TITLE, layout="wide")
 
-# --- LOADERS ---
+
 @st.cache_data
-def load_data():
-    if not Path(feat_path).exists():
+def load_data() -> pd.DataFrame | None:
+    """Load the processed feature table."""
+    if not FEATURE_PATH.exists():
         return None
-    df = pd.read_parquet(feat_path)
-    # Ensure sorted by time
-    df = df.sort_values(["iso_year", "iso_week"])
+
+    df = pd.read_parquet(FEATURE_PATH)
+    if {"iso_year", "iso_week"}.issubset(df.columns):
+        df = df.sort_values(["iso_year", "iso_week"])
+
     return df
 
+
 @st.cache_resource
-def load_model():
-    if not Path(model_path).exists():
+def load_model() -> dict | None:
+    """Load the trained model payload."""
+    if not MODEL_PATH.exists():
         return None
-    payload = joblib.load(model_path)
-    return payload
 
-def predict_risk(df_week, payload):
-    """Run the model on a specific slice of data."""
+    return joblib.load(MODEL_PATH)
+
+
+def predict_risk(df_week: pd.DataFrame, payload: dict) -> np.ndarray:
+    """Run the model on a selected week."""
     model = payload["model"]
-    features = payload["feature_cols"]
-    
-    # Prepare X (fill NaNs with 0 like in training)
-    X = df_week[features].fillna(0).values
-    
-    # Predict Probability (Risk)
-    probs = model.predict_proba(X)[:, 1]
-    return probs
+    feature_cols = payload["feature_cols"]
 
-# --- MAIN APP ---
-st.title(f"{PAGE_TITLE}")
+    missing = [col for col in feature_cols if col not in df_week.columns]
+    if missing:
+        raise ValueError(f"Missing model feature columns: {missing}")
+
+    X = df_week[feature_cols].fillna(0).astype("float64")
+    return model.predict_proba(X)[:, 1]
+
+
+def colour_from_risk(risk: float) -> list[int]:
+    risk = float(np.clip(risk, 0.0, 1.0))
+    red = int(risk * 255)
+    green = int((1.0 - risk) * 255)
+    return [red, green, 0, 160]
+
+
+def display_table_columns(df: pd.DataFrame) -> list[str]:
+    cols = ["h3", "risk_score"]
+
+    if "y_cluster_present" in df.columns and df["y_cluster_present"].notna().any():
+        cols.append("y_cluster_present")
+
+    for optional_col in [
+        "rain_mm_lag_1",
+        "temp_c_lag_1",
+        "rh_pct_lag_1",
+        "neighbor_pressure_lag_1",
+    ]:
+        if optional_col in df.columns:
+            cols.append(optional_col)
+
+    return cols
+
+
+st.title(PAGE_TITLE)
+st.caption(
+    "Research dashboard for inspecting weekly H3 risk rankings. "
+    "Scores are model outputs for active cluster-presence risk and should not be treated as operational decisions."
+)
 
 df = load_data()
 model_payload = load_model()
 
-if df is None or model_payload is None:
-    st.error("Data or Model not found! Run `make features` and `make model` first.")
+if df is None:
+    st.error("Feature table not found. Run the feature-building pipeline first.")
     st.stop()
 
-# SIDEBAR: Time Selection
-st.sidebar.header("Temporal Controls")
-years = sorted(df["iso_year"].unique())
+if model_payload is None:
+    st.error("Model file not found. Train the GBM model first.")
+    st.stop()
+
+required_time_cols = {"iso_year", "iso_week"}
+if not required_time_cols.issubset(df.columns):
+    st.error("Feature table must contain iso_year and iso_week columns.")
+    st.stop()
+
+st.sidebar.header("Time Selection")
+
+years = sorted(df["iso_year"].dropna().unique())
 selected_year = st.sidebar.select_slider("Year", options=years, value=years[-1])
 
-# Filter weeks for that year
-weeks = sorted(df[df["iso_year"] == selected_year]["iso_week"].unique())
+weeks = sorted(df.loc[df["iso_year"] == selected_year, "iso_week"].dropna().unique())
 selected_week = st.sidebar.select_slider("Week", options=weeks, value=weeks[-1])
 
-# Filter Data
 subset = df[(df["iso_year"] == selected_year) & (df["iso_week"] == selected_week)].copy()
 
-# PREDICT
-if not subset.empty:
-    with st.spinner("Calculating Risk Profiles..."):
-        risk_scores = predict_risk(subset, model_payload)
-        subset["risk_score"] = risk_scores
-        
-        # Color Scaling logic (Green -> Red)
-        # R, G, B, A
-        def get_color(risk):
-            # Simple gradient: Low risk = Green, High risk = Red
-            # 0.0 -> [0, 255, 0]
-            # 1.0 -> [255, 0, 0]
-            r = int(risk * 255)
-            g = int((1 - risk) * 255)
-            return [r, g, 0, 160] # 160 is transparency
-
-        subset["color"] = subset["risk_score"].apply(get_color)
-        
-        # Elevation logic (Higher risk = Taller hexagon)
-        subset["elevation"] = subset["risk_score"] * 2000 
-
-    # METRICS ROW
-    col1, col2, col3 = st.columns(3)
-    n_high_risk = len(subset[subset["risk_score"] > 0.5])
-    top_risk = subset["risk_score"].max()
-    
-    col1.metric("Selected Time", f"{selected_year}-W{selected_week:02d}")
-    col2.metric("High Risk Zones (>50%)", n_high_risk)
-    col3.metric("Max Risk Detected", f"{top_risk:.1%}")
-
-    # MAP VISUALIZATION (PyDeck)
-    st.subheader("Tactical Map")
-    
-    # 1. Add Map Style Picker (Updated with No-Key styles)
-    map_style_options = {
-        "Dark (Best for Contrast)": pdk.map_styles.CARTO_DARK,
-        "Light (Clean)": pdk.map_styles.CARTO_LIGHT,
-        "Roads (Detailed)": pdk.map_styles.CARTO_ROAD,
-    }
-    
-    selected_style_name = st.select_slider("Map Style", options=list(map_style_options.keys()))
-    # Get the actual style string based on the name selected
-    selected_style_url = map_style_options[selected_style_name]
-    
-    # H3 Layer (Keep this the same)
-    layer = pdk.Layer(
-        "H3HexagonLayer",
-        subset,
-        pickable=True,
-        stroked=True,
-        filled=True,
-        extruded=True,
-        get_hexagon="h3",
-        get_fill_color="color",
-        get_elevation="elevation",
-        elevation_scale=1,
-        elevation_range=[0, 1000],
-        render_sub_layers=True,
-        opacity=0.8
-    )
-
-    # View State (Keep this the same)
-    view_state = pdk.ViewState(
-        latitude=1.3521,
-        longitude=103.8198,
-        zoom=11,
-        pitch=50,
-        bearing=0
-    )
-
-    # Tooltip (Keep this the same)
-    tooltip = {
-        "html": "<b>H3:</b> {h3} <br/> <b>Risk:</b> {risk_score} <br/> <b>Rain:</b> {rain_mm_lag_1}mm",
-        "style": {"backgroundColor": "steelblue", "color": "white"}
-    }
-
-    r = pdk.Deck(
-        layers=[layer],
-        initial_view_state=view_state,
-        tooltip=tooltip,
-        map_style=selected_style_url  # <--- Pass the Carto URL here
-    )
-
-    st.pydeck_chart(r)
-    
-    # DATA TABLE
-    st.subheader("Priority List (Top 20)")
-    top_zones = subset.sort_values("risk_score", ascending=False).head(20)
-    st.dataframe(
-        top_zones[["h3", "risk_score", "y_cluster_present", "rain_mm_lag_1", "neighbor_pressure_lag_1"]],
-        use_container_width=True
-    )
-
-else:
+if subset.empty:
     st.warning("No data found for this week.")
+    st.stop()
+
+try:
+    with st.spinner("Scoring selected week..."):
+        subset["risk_score"] = predict_risk(subset, model_payload)
+except Exception as exc:
+    st.error(f"Prediction failed: {exc}")
+    st.stop()
+
+subset["risk_percent"] = subset["risk_score"] * 100.0
+subset["color"] = subset["risk_score"].apply(colour_from_risk)
+subset["elevation"] = subset["risk_score"] * 2000.0
+
+col1, col2, col3 = st.columns(3)
+
+col1.metric("Selected Week", f"{int(selected_year)}-W{int(selected_week):02d}")
+col2.metric("Zones Scored", f"{len(subset):,}")
+col3.metric("Max Score", f"{subset['risk_score'].max():.1%}")
+
+if "y_cluster_present" in subset.columns and subset["y_cluster_present"].notna().any():
+    known_labels = subset["y_cluster_present"].notna().sum()
+    active_clusters = int(subset["y_cluster_present"].fillna(0).sum())
+    st.caption(
+        f"Historical labels available for {known_labels:,} zones in this week. "
+        f"Active labelled zones: {active_clusters:,}."
+    )
+else:
+    st.caption("No target labels are available for this selected week. Rankings are model outputs only.")
+
+st.subheader("Risk Ranking Map")
+
+map_style_options = {
+    "Dark": pdk.map_styles.CARTO_DARK,
+    "Light": pdk.map_styles.CARTO_LIGHT,
+    "Roads": pdk.map_styles.CARTO_ROAD,
+}
+
+selected_style_name = st.selectbox("Map style", options=list(map_style_options.keys()))
+selected_style_url = map_style_options[selected_style_name]
+
+tooltip_parts = [
+    "<b>H3:</b> {h3}",
+    "<b>Risk score:</b> {risk_percent}%",
+]
+if "rain_mm_lag_1" in subset.columns:
+    tooltip_parts.append("<b>Rain lag 1:</b> {rain_mm_lag_1}")
+if "neighbor_pressure_lag_1" in subset.columns:
+    tooltip_parts.append("<b>Neighbour pressure lag 1:</b> {neighbor_pressure_lag_1}")
+
+tooltip_html = "<br/>".join(tooltip_parts)
+
+layer = pdk.Layer(
+    "H3HexagonLayer",
+    subset,
+    pickable=True,
+    stroked=True,
+    filled=True,
+    extruded=True,
+    get_hexagon="h3",
+    get_fill_color="color",
+    get_elevation="elevation",
+    elevation_scale=1,
+    elevation_range=[0, 1000],
+    opacity=0.8,
+)
+
+view_state = pdk.ViewState(
+    latitude=1.3521,
+    longitude=103.8198,
+    zoom=11,
+    pitch=50,
+    bearing=0,
+)
+
+deck = pdk.Deck(
+    layers=[layer],
+    initial_view_state=view_state,
+    tooltip={
+        "html": tooltip_html,
+        "style": {"backgroundColor": "white", "color": "black"},
+    },
+    map_style=selected_style_url,
+)
+
+st.pydeck_chart(deck)
+
+st.subheader("Top Ranked Zones")
+
+top_k = st.slider("Number of zones to show", min_value=5, max_value=100, value=20, step=5)
+top_zones = subset.sort_values("risk_score", ascending=False).head(top_k).copy()
+
+table_cols = display_table_columns(top_zones)
+st.dataframe(top_zones[table_cols], use_container_width=True)
+
+export_df = top_zones[table_cols]
+st.download_button(
+    "Download ranked zones as CSV",
+    export_df.to_csv(index=False).encode("utf-8"),
+    file_name=f"dengue_risk_ranking_{int(selected_year)}_W{int(selected_week):02d}.csv",
+    mime="text/csv",
+)
