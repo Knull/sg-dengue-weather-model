@@ -1,80 +1,54 @@
-# Singapore Dengue Risk Ranking Model
+# Singapore Dengue Cluster-Presence Ranking
 
-A research prototype for ranking geographic areas in Singapore by dengue cluster-presence risk using weather, spatial, and temporal features.
+A research project for ranking H3 cells in Singapore by **active dengue-cluster presence** using lagged weather, seasonality, and recent spatial cluster activity.
 
-The project studies whether recent cluster history, neighbouring cluster pressure, and lagged weather variables can improve weekly risk ranking over weather-only baselines. It should be read as an experimental modelling pipeline rather than an operational public-health decision tool.
+The project began as a tactical dengue-risk prototype, but the leakage-fixed experiments support a narrower conclusion: the current LightGBM pipeline is a useful spatiotemporal modelling exercise, **not evidence that the learned model improves on a simple persistence baseline**. On the historical archive used here, carrying last week's active cells forward is already a very strong predictor.
 
 ![Python](https://img.shields.io/badge/Python-3.11-blue)
 ![Model](https://img.shields.io/badge/Model-LightGBM-green)
-![Spatial](https://img.shields.io/badge/Spatial-H3_Hexagons-orange)
+![Spatial](https://img.shields.io/badge/Spatial-H3_res_8-orange)
 ![Dashboard](https://img.shields.io/badge/Dashboard-Streamlit-red)
 
 ---
 
-## Goal
+## What the project predicts
 
-The goal is to generate weekly ranked lists of H3 zones for retrospective evaluation and prospective monitoring. The model ranks areas by estimated active-cluster risk using spatial cluster-pressure features, weather lags, and seasonal information.
+The unit of prediction is an **H3 resolution-8 cell × ISO week**. The target is:
 
-The current target is active cluster presence. Active dengue clusters can persist across weeks, so some of the signal comes from recent cluster carryover rather than the first appearance of new clusters. The results should therefore be interpreted as risk-ranking evidence for this specific target.
+```text
+y_cluster_present = 1 if an archived cluster snapshot places an active dengue cluster
+                    in that H3 cell during that ISO week; otherwise 0
+```
 
-### Key Features
+This is **cluster presence**, not new-cluster onset and not dengue case counts. Active clusters often persist across adjacent weeks, so persistence is an important part of the problem.
 
-* **Spatial features:** Uses H3 geospatial indexing to measure cluster pressure from nearby zones.
-* **Nonlinear modelling:** Uses LightGBM with isotonic calibration for weather, temporal, and spatial features.
-* **Walk-forward validation:** Evaluates each test year using only earlier years for training.
-* **Live feature patching:** Supports a prospective monitoring workflow using the latest observed NEA cluster map as lagged spatial context.
-* **Dashboard:** Provides an interactive Streamlit map for inspecting ranked zones and model inputs.
+Historical cluster labels are reconstructed from SGCharts archive snapshots. Since the May 2026 leakage fix, the pipeline uses only weeks in which a cluster was actually observed in a raw snapshot; it no longer fills every week between a cluster's first and last appearance as active.
 
 ---
 
-## Quick Start
+## Current model
 
-### 1. Installation
+The main historical model is a `LightGBM` binary classifier wrapped with isotonic `CalibratedClassifierCV`.
 
-Clone the repository and install dependencies.
+The recorded walk-forward run used 26 numeric features. The current feature pipeline includes:
 
-```bash
-pip install -e .[dev]
-```
+- lagged weather features at **1, 2, 3, 4, 6, 8 and 12 weeks**;
+- seasonal week-of-year features;
+- `neighbor_pressure_lag_1`, the number of active cells in the previous week's H3 `k_ring(1)`.
 
-### 2. Historical evaluation
+Important detail: the explicit same-cell feature `self_lag_1` is excluded from the GBM. However, `neighbor_pressure_lag_1` is currently **inclusive of the centre cell**, so the model still receives a local persistence signal containing both the same H3 cell and its immediate neighbours.
 
-Run walk-forward cross-validation on the processed historical feature table.
-
-```bash
-python -m src.cli cv-gbm
-```
-
-### 3. Prospective monitoring workflow
-
-Fetch the latest live cluster map and use it to patch the feature table for a prospective ranking week.
-
-```bash
-# 1. Fetch the latest live cluster map from NEA
-python -m src.cli ingest-nea-live
-
-# 2. Patch the feature table using the latest observed live clusters
-# Replace the filename below with the file just downloaded in step 1
-python -m src.cli patch-live-week --live-geojson data/raw/nea_live/2026-01-03.geojson
-
-# 3. Generate the top-ranked zones
-# Use the year and week printed by the patch command
-python -m src.cli rank-riskiest --model-path data/processed/model_gbm.joblib --iso-year 2026 --iso-week 1
-```
-
-### 4. Launch the dashboard
-
-```bash
-streamlit run src/app.py
-```
+Same-week raw weather variables and `iso_year` are also excluded from model fitting.
 
 ---
 
-## Model Performance
+## Historical evaluation
 
-Current walk-forward CV on valid labelled years in the 2013 to 2020 archive, with each test year trained only on previous years:
+### Walk-forward LightGBM
 
-| Test Year | ROC AUC | AP | P@20 |
+The recorded leakage-fixed cross-validation uses valid labelled years from 2013–2020. Each test year is trained only on earlier labelled years.
+
+| Test year | ROC AUC | Average precision | P@20 |
 | --- | ---: | ---: | ---: |
 | 2014 | 0.6600 | 0.2159 | 0.3714 |
 | 2015 | 0.7217 | 0.2793 | 0.4875 |
@@ -83,70 +57,192 @@ Current walk-forward CV on valid labelled years in the 2013 to 2020 archive, wit
 | 2018 | 0.7507 | 0.1899 | 0.2317 |
 | 2019 | 0.8099 | 0.5177 | 0.6942 |
 | 2020 | 0.7179 | 0.3280 | 0.7111 |
-| **Mean** | **0.7254** | **0.3027** | **0.4634** |
+| **Macro mean** | **0.7254** | **0.3027** | **0.4634** |
 
-These results are for active cluster presence. Because active clusters persist over time, Precision@20 should be read as a ranking result for a persistence-influenced target rather than as a clean new-outbreak forecasting metric.
+`P@20` is computed week by week on weeks containing at least one positive cell, then averaged within each test year. The table above is the historical run saved in the project logs; the processed feature parquet itself is not committed to Git.
+
+### Last-week-clusters baseline
+
+A naive persistence baseline was rerun in September 2026 from a public mirror of the same SGCharts historical archive. It marks a cell as high risk when that **same H3 cell was active in the previous week**.
+
+Because this baseline produces many tied scores, its P@20 below is the expected P@20 under uniform random ordering inside score ties. This avoids making the result depend on arbitrary H3-string ordering.
+
+| Test year | ROC AUC | Average precision | Expected P@20 |
+| --- | ---: | ---: | ---: |
+| 2014 | 0.7074 | 0.2611 | 0.4509 |
+| 2015 | 0.7940 | 0.4378 | 0.6192 |
+| 2016 | 0.8056 | 0.4913 | 0.5902 |
+| 2017 | 0.7271 | 0.2262 | 0.2024 |
+| 2018 | 0.7670 | 0.3250 | 0.3140 |
+| 2019 | 0.8135 | 0.5337 | 0.7095 |
+| 2020 | 0.7372 | 0.3781 | 0.7315 |
+| **Macro mean** | **0.7645** | **0.3790** | **0.5168** |
+
+The same audit also evaluated the model's one-week **local-pressure primitive** by ranking cells on the previous week's inclusive H3 `k_ring(1)` active-cell count:
+
+| Baseline | ROC AUC | Average precision | Expected P@20 |
+| --- | ---: | ---: | ---: |
+| Same-cell last week | 0.7645 | 0.3790 | 0.5168 |
+| Local pressure last week | 0.7832 | 0.3430 | 0.4946 |
+| LightGBM | 0.7254 | 0.3027 | 0.4634 |
+
+**Current conclusion:** on these historical active-cluster labels, the learned LightGBM does not beat the simple persistence baselines on the macro headline metrics. The strong 2019/2020 P@20 values therefore should not be presented as evidence of incremental forecasting skill over “last week's clusters”.
+
+The reproducible baseline script is:
+
+```bash
+python scripts/evaluate_last_week_baseline.py
+```
+
+It downloads a public GitHub mirror of `dengue_clusters_archive.zip`, reconstructs H3-resolution-8 weekly labels, and writes `results/last_week_baseline.csv`.
+
+The original processed `unit_week_features.parquet` used for the LightGBM run is gitignored, so the baseline rerun is a reconstruction from the source archive rather than a byte-for-byte replay of that local parquet.
+
+---
+
+## Data and leakage fixes
+
+The historical pipeline combines:
+
+- **Dengue cluster snapshots:** SGCharts historical archive, derived from publicly displayed Singapore dengue-cluster information.
+- **Weather:** Meteorological Service Singapore historical weather ingestion.
+- **Spatial grid:** H3 resolution 8.
+
+The May 2026 leakage repair made several material changes:
+
+1. cluster labels are built from **observed raw snapshot weeks**, rather than interpolating all weeks from `first_seen` to `last_seen`;
+2. pre-existing 0/1 labels are preserved when building the feature panel instead of turning all joined rows into positives;
+3. `self_lag_1`, `iso_year`, and same-week raw weather fields are excluded from GBM fitting;
+4. weather lag 0 was removed;
+5. temporal CV became strict walk-forward training on years earlier than the test year.
+
+Years with zero positive labels in the local feature table are excluded from the reported CV rather than interpreted as dengue-free years. In the recorded run, 2011–2012 and 2021–2025 were excluded; the labelled evaluation period is therefore 2013–2020.
+
+---
+
+## Reproduction
+
+### Installation
+
+```bash
+pip install -e .[dev]
+```
+
+The Streamlit dashboard has an additional requirement:
+
+```bash
+pip install -r dashboard/requirements.txt
+```
+
+### Persistence baseline
+
+This is the most self-contained evaluation because the script downloads its public archive mirror automatically:
+
+```bash
+python scripts/evaluate_last_week_baseline.py
+```
+
+### Historical LightGBM
+
+The raw and processed datasets are not committed, so a fresh clone cannot run `cv-gbm` immediately. After the historical archive and weather data have been ingested and the processed feature table has been built:
+
+```bash
+python -m src.cli cv-gbm
+```
+
+The main ETL commands are:
+
+```bash
+python -m src.cli ingest-archive
+python -m src.cli ingest-weather
+python -m src.cli build-history
+python -m src.cli build-cluster-week
+python -m src.cli build-features
+python -m src.cli cv-gbm
+```
+
+See `python -m src.cli --help` for paths and options.
+
+---
+
+## Live-week prototype
+
+The repository contains a live-cluster patching path:
+
+```bash
+python -m src.cli ingest-nea-live
+python -m src.cli patch-live-week --live-geojson <downloaded-file.geojson>
+python -m src.cli rank-riskiest --model-path data/processed/model_gbm.joblib --iso-year <year> --iso-week <week>
+```
+
+This should be treated as **prototype scaffolding**, not as a validated prospective forecast.
+
+`patch-live-week` currently:
+
+- maps the latest live NEA cluster polygons into H3 cells;
+- uses them to populate the one-week spatial cluster features;
+- targets approximately one week ahead;
+- **copies the latest available non-cluster feature values forward**.
+
+It does not currently ingest an actual future weather forecast, and the live path has not been prospectively validated against labelled post-2020 outcomes.
+
+---
+
+## Dashboard
+
+```bash
+streamlit run src/app.py
+```
+
+The dashboard loads the processed feature table and trained GBM payload, allows a year/week selection, and visualises model scores over H3 cells. It is an exploratory interface, not an operational public-health tool.
+
+---
+
+## Project structure
+
+```text
+.
+├── config/
+│   └── config.default.yaml
+├── dashboard/
+│   └── requirements.txt
+├── results/
+│   └── last_week_baseline.csv
+├── scripts/
+│   └── evaluate_last_week_baseline.py
+├── src/
+│   ├── app.py
+│   ├── cli.py
+│   └── dengueweather/
+│       ├── build/
+│       ├── ingest/
+│       ├── model/
+│       └── viz/
+└── pyproject.toml
+```
 
 ---
 
 ## Limitations
 
-- **Target definition:** The target is active cluster presence. It does not attempt to model new-cluster onset directly.
-- **Cluster persistence:** Part of the signal comes from recent self and neighbouring cluster activity.
-- **Archive coverage:** Positive-rate by year varies substantially. Low-positive years may reflect transmission lulls or gaps in the SGCharts and NEA archive ingest.
-- **Recent years:** The current archive has no positive labels after 2020, so the live monitoring workflow has not yet been validated on labelled post-2020 outcomes.
-- **Operational use:** The project is a research prototype. It should not be used for public-health intervention decisions without prospective validation, uncertainty analysis, and domain review.
+- **Target mismatch:** active-cluster presence is not new-cluster onset, incidence, or outbreak expansion.
+- **Persistence dominates:** a one-week persistence baseline currently outperforms the learned model on macro AUC, AP and tie-aware P@20.
+- **Archive completeness:** historical labels depend on archived snapshots; low-positive periods may represent real transmission changes, incomplete archival coverage, or both.
+- **Reproducibility gap:** the exact processed feature parquet from the recorded GBM run is not committed.
+- **Live path is unvalidated:** post-2020 prospective performance has not been measured, and future-weather inputs are not implemented.
+- **No causal interpretation:** feature importance or risk score should not be interpreted as a causal effect of weather or neighbouring clusters.
+- **Not for intervention decisions:** this repository is a research/engineering prototype.
 
 ---
 
-## Engineering Pipeline
+## Next useful experiments
 
-The system uses a modular ETL pipeline managed by `src.cli`:
+The current results point to a clearer next research question: can a model add signal **beyond persistence**?
 
-1. **Ingest**
-   * `download-weather`: Downloads historical MSS daily weather data.
-   * `ingest-archive`: Merges historical SGCharts or NEA archive snapshots.
-   * `ingest-nea-live`: Fetches the latest active cluster map from Data.gov.sg.
+Useful follow-ups would be:
 
-2. **Process**
-   * `build-history`: Constructs stable cluster histories from archived snapshots.
-   * `build-cluster-week`: Converts cluster histories into weekly H3 labels.
-   * `build-features`: Builds weekly H3 features, including weather lags and spatial cluster-pressure features.
-
-3. **Model**
-   * `fit-gbm`: Trains a LightGBM classifier with isotonic calibration.
-   * `cv-gbm`: Runs walk-forward validation by test year.
-   * `rank-riskiest`: Produces a ranked list of H3 zones for a selected year and week.
-
-4. **Visualise**
-   * `streamlit run src/app.py`: Opens the dashboard for inspecting ranked zones and input features.
-
----
-
-## Project Structure
-
-```text
-.
-├── data/
-│   ├── raw/                # MSS weather files and NEA GeoJSONs
-│   ├── interim/            # Parquet checkpoints
-│   └── processed/          # Feature tables and trained models
-├── src/
-│   ├── app.py              # Streamlit dashboard
-│   ├── cli.py              # Command-line interface
-│   └── dengueweather/
-│       ├── build/          # Feature engineering logic
-│       ├── ingest/         # Data ingestion utilities
-│       ├── model/          # Model training and evaluation code
-│       └── viz/            # Mapping and plotting utilities
-└── pyproject.toml          # Dependencies
-```
-
----
-
-## Future Work
-
-* Add prospective validation once labelled outcomes are available for recent years.
-* Add SHAP or permutation-based explanations for top-ranked zones.
-* Separate active-cluster persistence from new-cluster onset in a future target definition.
-* Add uncertainty summaries for top-k rankings.
+1. predict **new-cluster onset** among cells that were inactive in the prior week;
+2. compare every learned model directly against same-cell and local-pressure persistence;
+3. make the local-pressure feature exclude the centre cell to separate persistence from neighbourhood spread;
+4. add real prospective weather inputs before evaluating the live path;
+5. retain a frozen, versioned feature table or data manifest so historical results are fully replayable.
