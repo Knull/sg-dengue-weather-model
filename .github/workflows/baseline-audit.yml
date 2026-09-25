@@ -1,6 +1,8 @@
 name: Dengue baseline audit
 
 on:
+  push:
+    branches: [baseline-readme-refresh-20260925]
   pull_request:
     branches: [main]
   workflow_dispatch:
