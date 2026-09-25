@@ -204,12 +204,14 @@ def build_label_panel(
         values="self_lag_1",
     ).fillna(0.0)
 
-    pressure = pd.DataFrame(index=lag_grid.index)
+    pressure_columns = {}
     for cell in h3_cells:
         neighbors = neighborhoods[cell]
-        pressure[cell] = (
-            lag_grid[neighbors].sum(axis=1) if neighbors else 0.0
+        pressure_columns[cell] = (
+            lag_grid[neighbors].sum(axis=1) if neighbors
+            else pd.Series(0.0, index=lag_grid.index)
         )
+    pressure = pd.DataFrame(pressure_columns, index=lag_grid.index)
 
     pressure_long = (
         pressure.reset_index()
